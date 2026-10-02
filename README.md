@@ -97,9 +97,15 @@ Download **`BHDisplay-x.y.z.pkg`** (installer) or **`.dmg`** (drag to Applicatio
 open-source but **not notarized by Apple** (that needs a paid Apple Developer account), so
 macOS shows a one-time warning the **first** time you open it. You only do this **once**:
 
-- **`.pkg`:** if macOS says *"unidentified developer"* → **right-click the `.pkg` → Open → Open**.
-- **`.dmg`:** drag **BHDisplay** to Applications and open it. If it says *"can't be opened…"*
-  or *"is damaged"* → **System Settings → Privacy & Security**, scroll down to
+- **`.pkg` (recommended):**
+  1. Double-click **`BHDisplay-x.y.z.pkg`**. macOS says it can't verify the developer and offers
+     **Move to Trash** — click **Done** instead (don't trash it).
+  2. Open **System Settings → Privacy & Security**, scroll down to
+     *"BHDisplay-x.y.z.pkg was blocked…"* → **Open Anyway** → confirm with Touch ID / password.
+  3. The installer opens — click through it. BHDisplay then opens normally, with **no second
+     warning** (apps installed by the `.pkg` aren't flagged).
+- **`.dmg`:** drag **BHDisplay** to Applications and open it. macOS shows the same warning for the
+  app itself → click **Done** → **System Settings → Privacy & Security** →
   *"BHDisplay was blocked…"* → **Open Anyway** → **Open**.
 
 The "damaged"/"can't be checked" message is just the download-quarantine flag on an
