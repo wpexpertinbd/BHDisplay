@@ -73,6 +73,18 @@ menu uses. No drivers, no background services, no account — just a menu-bar ic
   **USB-C to HDMI** adapters pass the picture but block DDC/CI — the app then shows
   *"Monitor refused DDC"* and can't switch anything. That is the adapter, not the app.
 
+### 🛒 The exact setup we use — where to buy (Bangladesh)
+
+Asked often, so here it is — the monitor and cable BHDisplay is built and tested with:
+
+| What | Product | Buy |
+|------|---------|-----|
+| 🖥️ Monitor | **ViewSonic XG2409A** — 24″ FHD gaming monitor (DisplayPort + 2× HDMI) | [Ryans Computers](https://www.ryans.com/viewsonic-xg2409a-24-inch-fhd-display-gaming-monitor) |
+| 🔌 Cable (Mac) | **ONTEN OTN-8318** — HDMI to HDMI, 1.5 m — MacBook's HDMI port → monitor | [Ryans Computers](https://www.ryans.com/onten-otn-8318-1.5-meter-black-cable) |
+
+> The other computer (e.g. a Windows PC) goes into the monitor's **DisplayPort** with a normal
+> DisplayPort cable. Not sponsored — just what we use.
+
 ## ⬇️ Download & Install
 
 Grab the latest build from the [**Releases**](https://github.com/wpexpertinbd/BHDisplay/releases) page.
