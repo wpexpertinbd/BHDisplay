@@ -91,19 +91,19 @@ Grab the latest build from the [**Releases**](https://github.com/wpexpertinbd/BH
 
 ### 🍎 macOS
 
-Download **`BHDisplay-x.y.z.pkg`** (installer) or **`.dmg`** (drag to Applications).
+Download **`BHDisplay-x.x.x.pkg`** (installer) or **`.dmg`** (drag to Applications).
 
 **⚠️ First launch — "unidentified developer" / "damaged" (read this):** BHDisplay is free and
 open-source but **not notarized by Apple** (that needs a paid Apple Developer account), so
 macOS shows a one-time warning the **first** time you open it. You only do this **once**:
 
 - **`.pkg` (recommended):**
-  1. Double-click **`BHDisplay-x.y.z.pkg`**. macOS says it can't verify the developer and offers
+  1. Double-click **`BHDisplay-x.x.x.pkg`**. macOS says it can't verify the developer and offers
      **Move to Trash** — click **Done** instead (don't trash it).
   2. Open **System Settings → Privacy & Security**, scroll down to
-     *"BHDisplay-x.y.z.pkg was blocked…"* → **Open Anyway** → confirm with Touch ID / password.
-  3. The installer opens — click through it. BHDisplay then opens normally, with **no second
-     warning** (apps installed by the `.pkg` aren't flagged).
+     *"BHDisplay-x.x.x.pkg was blocked…"* → **Open Anyway** → confirm with Touch ID / password.
+  3. The installer opens — click through it. When it finishes, **BHDisplay starts by itself**
+     (menu-bar icon), with **no second warning** — apps installed by the `.pkg` aren't flagged.
 - **`.dmg`:** drag **BHDisplay** to Applications and open it. macOS shows the same warning for the
   app itself → click **Done** → **System Settings → Privacy & Security** →
   *"BHDisplay was blocked…"* → **Open Anyway** → **Open**.

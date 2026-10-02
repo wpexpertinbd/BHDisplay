@@ -7,8 +7,8 @@ cd "${0:A:h}"
 
 NAME=BHDisplay
 BUNDLE_ID=com.biswashost.bhdisplay
-VERSION=1.0.0
-BUILD_NUM=1
+VERSION=1.0.1
+BUILD_NUM=2
 APP=build/$NAME.app
 
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

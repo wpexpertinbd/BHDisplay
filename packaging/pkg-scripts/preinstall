@@ -1,10 +1,11 @@
 #!/bin/sh
 #
-# Runs (as root) BEFORE the new BHDisplay.app is written. Quits a running copy so a
-# reinstall replaces the live menu-bar app instead of leaving the old version running.
-# Matches the installed executable by full path, so no other process named BHDisplay is touched.
+# Runs (as root) BEFORE the new BHDisplay.app is written. Quits a running copy so a reinstall
+# replaces the live menu-bar app instead of leaving the old version running.
+# Exact executable path (dots escaped), followed only by arguments. Only when installing to the
+# boot volume ($3 = target volume) — another disk's install has nothing running.
 
-# Exact executable path (dots escaped), followed only by arguments.
+[ "${3:-/}" = "/" ] || exit 0
 PAT='^/Applications/BHDisplay\.app/Contents/MacOS/BHDisplay( |$)'
 
 /usr/bin/pkill -TERM -f "$PAT" 2>/dev/null || true
@@ -12,7 +13,7 @@ PAT='^/Applications/BHDisplay\.app/Contents/MacOS/BHDisplay( |$)'
 i=0
 while [ "$i" -lt 5 ]; do
     /usr/bin/pgrep -f "$PAT" >/dev/null 2>&1 || exit 0
-    sleep 1
+    /bin/sleep 1
     i=$((i + 1))
 done
 

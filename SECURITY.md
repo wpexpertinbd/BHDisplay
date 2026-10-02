@@ -31,5 +31,10 @@ You'll get a response as soon as possible.
 
 Releases are ad-hoc signed with the Hardened Runtime but **not notarized** (no paid Apple
 Developer account). Build from source (`./build.sh`) if you prefer to verify what you run.
-The `.pkg` installs only `/Applications/BHDisplay.app`; its single pre-install script quits a
-running copy of BHDisplay (matched by its full path) so the update replaces it.
+The `.pkg` installs only `/Applications/BHDisplay.app` and has two small scripts: **preinstall**
+quits a running copy of BHDisplay (matched by its exact path) so the update replaces it, and
+**postinstall** reopens it as the user logged in at the screen — never as root, and not at all
+when nobody is logged in. Both act only when installing to the startup disk, and postinstall opens
+the path only if it is a real folder (not a symlink) whose bundle ID is `com.biswashost.bhdisplay`.
+Known limit: with several users logged in (fast user switching), other users' copies are quit too
+and come back at their next login.
