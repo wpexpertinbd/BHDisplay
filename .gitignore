@@ -1,0 +1,8 @@
+.DS_Store
+build/
+dist/
+*.dmg
+*.pkg
+Icon/AppIcon.iconset/
+.claude/
+CLAUDE.md

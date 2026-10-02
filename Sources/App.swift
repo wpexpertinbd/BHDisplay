@@ -1,0 +1,273 @@
+import AppKit
+import SwiftUI
+import Carbon.HIToolbox
+import ServiceManagement
+
+enum Brand {
+    static let website = "https://www.biswashost.com/"
+    static let websiteLabel = "www.biswashost.com"
+    static let repo = "https://github.com/wpexpertinbd/BHDisplay"
+    static let repoLabel = "github.com/wpexpertinbd/BHDisplay"
+    /// `-DocsScreenshot` on the command line hides the real serial number for public screenshots.
+    static let docsMode = CommandLine.arguments.contains("-DocsScreenshot")
+    static var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev" }
+}
+
+@main
+enum Entry {
+    static func main() {
+        if CommandLine.arguments.count > 1, CommandLine.arguments[1].hasPrefix("--") { CLI.run(CommandLine.arguments) }
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+}
+
+// BHDisplay --get | --input dp|hdmi1|hdmi2 | --login on|off|status
+// Raw VCP access is for diagnostics only and must be asked for explicitly:
+//   --read CODE           CODE is hex (e.g. E2 or 0xE2)
+//   --unsafe --set CODE VALUE   VALUE is decimal, or hex with a 0x prefix
+// Commands that can wipe or power off the monitor additionally need --really.
+enum CLI {
+    /// Factory/geometry/colour restore and power mode — a typo here costs the user their settings.
+    static let destructive: Set<UInt8> = [0x04, 0x05, 0x06, 0x08, 0x0A, 0xD6]
+
+    static func hexCode(_ s: String) -> UInt8? {
+        let t = s.lowercased().hasPrefix("0x") ? String(s.dropFirst(2)) : s
+        return UInt8(t, radix: 16)
+    }
+    static func value(_ s: String) -> UInt16? {
+        s.lowercased().hasPrefix("0x") ? UInt16(s.dropFirst(2), radix: 16) : UInt16(s, radix: 10)
+    }
+
+    static func run(_ argv: [String]) -> Never {
+        let allowRaw = argv.contains("--unsafe"), really = argv.contains("--really")
+        let args = argv.filter { $0 != "--unsafe" && $0 != "--really" }
+        guard args.count > 1 else { usage() }
+        if args[1] == "--login" {   // --login on|off|status  (same SMAppService as the menu item)
+            let svc = SMAppService.mainApp
+            do {
+                switch args.count > 2 ? args[2] : "status" {
+                case "on": try svc.register()
+                case "off": try svc.unregister()
+                default: break
+                }
+            } catch { fputs("login item: \(error.localizedDescription)\n", stderr); exit(1) }
+            let names: [SMAppService.Status: String] = [.enabled: "enabled", .notRegistered: "not registered",
+                                                        .requiresApproval: "requires approval in System Settings → Login Items",
+                                                        .notFound: "not found"]
+            print("launch at login:", names[svc.status] ?? "unknown")
+            exit(0)
+        }
+        guard let ddc = DDC.firstExternal() else { fputs("\(DDCError.noExternalDisplay)\n", stderr); exit(1) }
+        do {
+            switch args[1] {
+            case "--get":
+                let v = try ddc.read(VCP.input)
+                print(MonitorInput.name(for: v.current), String(format: "(0x%02X)", v.current & 0xFF))
+            case "--input" where args.count > 2:
+                let byName = Dictionary(uniqueKeysWithValues: MonitorInput.all.map {
+                    ($0.name.lowercased().replacingOccurrences(of: " ", with: ""), $0.id) })
+                let key = args[2].lowercased()
+                guard let code = byName[key] ?? (key == "dp" ? 0x0F : nil)
+                        ?? hexCode(key).map({ UInt16($0) }).flatMap({ MonitorInput.isValid($0) ? $0 : nil })
+                else { fputs("unknown input \(args[2]) — use dp, hdmi1 or hdmi2\n", stderr); exit(2) }
+                try ddc.write(VCP.input, code, repeats: 2)
+                print("switched to \(MonitorInput.name(for: code))")
+            case "--read" where args.count > 2:
+                guard let c = hexCode(args[2]) else { fputs("CODE must be hex, e.g. E2\n", stderr); exit(2) }
+                let v = try ddc.read(c)
+                print(String(format: "VCP 0x%02X = %d (max %d)", c, v.current, v.max))
+            case "--set" where args.count > 3:
+                guard allowRaw else {
+                    fputs("--set writes raw monitor commands; repeat with --unsafe if you mean it\n", stderr); exit(3)
+                }
+                guard let c = hexCode(args[2]), let v = value(args[3]) else {
+                    fputs("CODE must be hex (E2), VALUE decimal (40) or 0x-hex (0x28)\n", stderr); exit(2)
+                }
+                if c == VCP.input && !MonitorInput.isValid(v) {
+                    fputs("not an input of this monitor — use --input dp|hdmi1|hdmi2\n", stderr); exit(2)
+                }
+                if destructive.contains(c) && !really {
+                    fputs(String(format: "VCP 0x%02X can reset or power off the monitor; add --really to send it\n", c), stderr); exit(3)
+                }
+                try ddc.write(c, v)
+                print(String(format: "VCP 0x%02X <- %d", c, v))
+            default:
+                usage()
+            }
+            exit(0)
+        } catch { fputs("\(error)\n", stderr); exit(1) }
+    }
+
+    static func usage() -> Never {
+        print("""
+        usage: BHDisplay --get
+               BHDisplay --input dp|hdmi1|hdmi2
+               BHDisplay --login on|off|status
+               BHDisplay --read CODE                      (diagnostics, CODE in hex)
+               BHDisplay --unsafe --set CODE VALUE        (diagnostics, raw write)
+        """)
+        exit(2)
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
+    private var status: NSStatusItem!
+    private var window: NSWindow?
+    private var hotKeys: [EventHotKeyRef?] = []
+    private let m = MonitorModel.shared
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        status.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "BHDisplay")
+        let menu = NSMenu(); menu.delegate = self; status.menu = menu
+        registerHotKeys()
+        m.refresh()
+        // Re-read when the monitor is plugged/unplugged or wakes.
+        CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
+            if flags.contains(.beginConfigurationFlag) { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { MonitorModel.shared.refresh() }
+        }, nil)
+        if CommandLine.arguments.contains("-DocsOpenMenu") {   // docs only: pop the menu for a screenshot
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.status.button?.performClick(nil) }
+            return
+        }
+        if !launchedAsLoginItem() { showWindow() }
+    }
+
+    func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool { showWindow(); return false }
+
+    private func launchedAsLoginItem() -> Bool {
+        guard let ev = NSAppleEventManager.shared().currentAppleEvent else { return false }
+        return ev.eventID == kAEOpenApplication &&
+            ev.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+    }
+
+    @objc func showWindow() {
+        if window == nil {
+            let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            w.title = "BHDisplay"
+            w.contentView = NSHostingView(rootView: ContentView())
+            w.isReleasedWhenClosed = false
+            w.delegate = self
+            w.center()
+            window = w
+        }
+        // Dock icon only while the settings window is open; closing it returns to menu-bar only.
+        NSApp.setActivationPolicy(.regular)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+        m.refresh()
+    }
+
+
+    func windowWillClose(_ n: Notification) { NSApp.setActivationPolicy(.accessory) }
+
+    // Rebuilt on every open so the tick reflects the monitor's answer, not a cached guess.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let head = NSMenuItem(title: m.error ?? "\(m.info.name) — \(m.input.map(m.label) ?? "reading…")", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        menu.addItem(head)
+        menu.addItem(.separator())
+        if let n = m.notice {
+            let w = NSMenuItem(title: "⚠︎ " + n, action: nil, keyEquivalent: ""); w.isEnabled = false
+            menu.addItem(w); menu.addItem(.separator())
+        }
+        if m.macInput != nil {
+            let t = NSMenuItem(title: m.input == m.macInput ? "Switch to Other Computer" : "Switch to This Mac",
+                               action: #selector(toggle), keyEquivalent: "s")
+            t.keyEquivalentModifierMask = [.control, .option, .command]; t.target = self
+            menu.addItem(t)
+            menu.addItem(.separator())
+        }
+        for (i, inp) in MonitorInput.all.enumerated() {
+            let it = NSMenuItem(title: m.label(inp.id), action: #selector(pick(_:)), keyEquivalent: "\(i + 1)")
+            it.keyEquivalentModifierMask = [.control, .option, .command]
+            it.tag = Int(inp.id); it.target = self
+            it.state = m.input == inp.id ? .on : .off
+            menu.addItem(it)
+        }
+        let ad = NSMenuItem(title: "Auto Detect Input", action: #selector(toggleAutoDetect), keyEquivalent: ""); ad.target = self
+        ad.state = m.autoDetect == true ? .on : .off
+        ad.isEnabled = m.autoDetect != nil
+        menu.addItem(ad)
+        menu.addItem(.separator())
+        let ab = NSMenuItem(title: "About BHDisplay", action: #selector(showAbout), keyEquivalent: ""); ab.target = self
+        menu.addItem(ab)
+        let o = NSMenuItem(title: "Open BHDisplay…", action: #selector(showWindow), keyEquivalent: ","); o.target = self
+        menu.addItem(o)
+        let l = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: ""); l.target = self
+        switch SMAppService.mainApp.status {
+        case .enabled: l.state = .on
+        case .requiresApproval: l.state = .mixed; l.title = "Launch at Login — approve in System Settings…"
+        default: l.state = .off
+        }
+        menu.addItem(l)
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit BHDisplay", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q"))
+        m.refresh(full: true)
+    }
+
+    @objc private func toggle() { m.toggleMacOther() }
+
+    @objc private func showAbout() {
+        let credits = NSMutableAttributedString()
+        let body: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.labelColor]
+        func line(_ s: String) { credits.append(NSAttributedString(string: s, attributes: body)) }
+        func link(_ title: String, _ url: String) {
+            var a = body; a[.link] = URL(string: url)!
+            credits.append(NSAttributedString(string: title, attributes: a))
+        }
+        line("Built by BiswasHost\n"); link(Brand.websiteLabel, Brand.website)
+        line("\n\nFree & open-source:\n"); link(Brand.repoLabel, Brand.repo)
+        line("\n\nMonitor control over DDC/CI for ViewSonic displays.\nNot affiliated with or endorsed by ViewSonic.")
+        let p = NSMutableParagraphStyle(); p.alignment = .center
+        credits.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: credits.length))
+        NSApp.activate()
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
+    }
+    @objc private func toggleAutoDetect() { if let a = m.autoDetect { m.setAutoDetect(!a) } }
+    @objc private func pick(_ s: NSMenuItem) { m.switchTo(UInt16(s.tag)) }
+
+    @objc private func toggleLogin() {
+        let svc = SMAppService.mainApp
+        do {
+            switch svc.status {
+            case .enabled: try svc.unregister()
+            case .requiresApproval: SMAppService.openSystemSettingsLoginItems()   // the user must approve it there
+            default:
+                try svc.register()
+                if svc.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+            }
+        } catch { m.error = "Login item: \(error.localizedDescription)" }
+    }
+
+    // Global ⌃⌥⌘S / 1 / 2 / 3 — Carbon hot keys need no Accessibility permission.
+    private func registerHotKeys() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, ev, _ in
+            var hk = EventHotKeyID()
+            GetEventParameter(ev, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
+            let id = Int(hk.id)
+            DispatchQueue.main.async {
+                let m = MonitorModel.shared
+                if id == 9 { m.toggleMacOther() }
+                else if MonitorInput.all.indices.contains(id - 1) { m.switchTo(MonitorInput.all[id - 1].id) }
+            }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let keys: [(Int, UInt32)] = [(kVK_ANSI_1, 1), (kVK_ANSI_2, 2), (kVK_ANSI_3, 3), (kVK_ANSI_S, 9)]
+        for (k, id) in keys {
+            var ref: EventHotKeyRef?
+            RegisterEventHotKey(UInt32(k), UInt32(controlKey | optionKey | cmdKey),
+                                EventHotKeyID(signature: OSType(0x42484450), id: id), GetApplicationEventTarget(), 0, &ref)
+            hotKeys.append(ref)
+        }
+    }
+}
