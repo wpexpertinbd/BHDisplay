@@ -62,7 +62,8 @@ internal static class Screens
         return list;
     }
 
-    private static (int L, int T, int R, int B) Union(List<Native.RECT> ms) =>
+    // No monitor at all (the only one switched to the Mac and dropped): use a nominal desktop, never crash.
+    private static (int L, int T, int R, int B) Union(List<Native.RECT> ms) => ms.Count == 0 ? (0, 0, 1920, 1080) :
         (ms.Min(r => r.Left), ms.Min(r => r.Top), ms.Max(r => r.Right), ms.Max(r => r.Bottom));
 
     /// Monitors touching the outer `edge` (0 left, 1 right) of the desktop.

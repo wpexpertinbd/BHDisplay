@@ -30,7 +30,7 @@ enum DisplayPower {
     /// A display we turned off in an earlier run that was never turned back on: turn it on now.
     static func restoreLeftover() {
         guard let fn = enableFn, disabledID == nil, let saved = UserDefaults.standard.object(forKey: savedKey) as? Int else { return }
-        let id = CGDirectDisplayID(saved)
+        guard let id = CGDirectDisplayID(exactly: saved) else { UserDefaults.standard.removeObject(forKey: savedKey); return }
         if !isActive(id) { _ = apply({ fn($0, id, true) }) }
         UserDefaults.standard.removeObject(forKey: savedKey)
     }

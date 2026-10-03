@@ -8,7 +8,7 @@ import CryptoKit
 /// Thread-safety: all mutable state is touched only on `queue`; public methods hop onto it.
 final class ShareSession: @unchecked Sendable {
     enum Role { case dialer, listener }
-    private enum State { case hello, auth, open, closed }
+    private enum State { case commit, hello, auth, open, closed }
 
     let role: Role
     let queue: DispatchQueue
@@ -17,6 +17,7 @@ final class ShareSession: @unchecked Sendable {
     private let ephemeral = P256.KeyAgreement.PrivateKey()
     private var myHello = Data()
     private var peerHelloRaw = Data()
+    private var peerCommit = Data()
     private var transcript = Data()
     private var state = State.hello
     private var sendCipher: RecordCipher?
@@ -59,11 +60,13 @@ final class ShareSession: @unchecked Sendable {
 
     func start() {
         keepAlive = self
+        state = role == .dialer ? .commit : .hello
         conn.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
             switch st {
             case .ready:
-                if self.role == .dialer { self.sendHello() }
+                // Listener commits to its HELLO first; the dialer sends its HELLO only after receiving that.
+                if self.role == .listener { self.makeHello(); self.writeFrame(Handshake.commitment(listenerHello: self.myHello)) }
                 self.readFrame()
             case .failed(let e): self.closeNow("connection failed: \(e)")
             case .cancelled: self.closeNow("connection closed")
@@ -108,17 +111,16 @@ final class ShareSession: @unchecked Sendable {
         switch state {
         case .open:
             if idle > 6 { closeNow("peer stopped responding") } else { send(.ping) }
-        case .hello, .auth:
-            if idle > 10 { closeNow("handshake timed out") }
+        case .commit, .hello, .auth:
+            if idle > 5 { closeNow("handshake timed out") }
         case .closed: break
         }
     }
 
-    private func sendHello() {
+    private func makeHello() {
         myHello = Hello(deviceID: identity.deviceID, identityKey: identity.publicKey,
                         ephemeralKey: ephemeral.publicKey.x963Representation,
                         nonce: Data.random(32), name: identity.name).encoded
-        writeFrame(myHello)
     }
 
     private func writeFrame(_ body: Data) {
@@ -134,7 +136,8 @@ final class ShareSession: @unchecked Sendable {
             guard err == nil, let head, head.count == 4 else { self.closeNow(done ? "peer closed" : "receive failed"); return }
             var r = WireReader(head)
             let n = Int((try? r.u32()) ?? 0)
-            guard n >= 1, n <= BHDS.maxFrame else { self.closeNow("bad frame length"); return }
+            // Before authentication only small handshake frames are allowed.
+            guard n >= 1, n <= (self.state == .open ? BHDS.maxFrame : 512) else { self.closeNow("bad frame length"); return }
             self.conn.receive(minimumIncompleteLength: n, maximumLength: n) { body, _, _, err in
                 guard self.state != .closed else { return }
                 guard err == nil, let body, body.count == n else { self.closeNow("receive failed"); return }
@@ -147,11 +150,19 @@ final class ShareSession: @unchecked Sendable {
 
     private func handle(_ frame: Data) throws {
         switch state {
+        case .commit:
+            guard frame.count == 32 else { throw WireError.bad("bad commitment") }
+            peerCommit = frame
+            makeHello(); writeFrame(myHello)
+            state = .hello
         case .hello:
             let h = try Hello.decode(frame)
             guard h.deviceID != identity.deviceID else { throw WireError.bad("connected to itself") }
+            if role == .dialer {
+                guard Handshake.commitment(listenerHello: frame) == peerCommit else { throw WireError.bad("peer's HELLO doesn't match its commitment") }
+            }
             peer = h; peerHelloRaw = frame
-            if role == .listener { sendHello() }
+            if role == .listener { writeFrame(myHello) }
             transcript = role == .dialer
                 ? Handshake.transcript(dialerHello: myHello, listenerHello: frame)
                 : Handshake.transcript(dialerHello: frame, listenerHello: myHello)
@@ -257,6 +268,7 @@ final class ShareDiscovery: @unchecked Sendable {
 
     private var beacon = Data()
     private var lastReply: [String: Date] = [:]
+    private var windowStart = Date.distantPast, windowCount = 0
 
     /// The limited broadcast (255.255.255.255) can leave through the wrong adapter on machines with several
     /// (VPN, virtual switches), so also send to every up, non-loopback IPv4 interface's own subnet broadcast.
@@ -323,9 +335,16 @@ final class ShareDiscovery: @unchecked Sendable {
             var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             inet_ntop(AF_INET, &ip, &text, socklen_t(INET_ADDRSTRLEN))
             let host = String(cString: text)
+            // A flood of (spoofed) beacons must not reach the main thread, where the input event tap runs:
+            // a real peer sends one every 2 s, so 20 a second overall is generous.
+            let now = Date()
+            if now.timeIntervalSince(windowStart) >= 1 { windowStart = now; windowCount = 0 }
+            windowCount += 1
+            guard windowCount <= 20 else { continue }
+            if lastReply.count > 256 { lastReply = lastReply.filter { now.timeIntervalSince($0.value) < 5 } }
             reply(to: host)
             onBeacon?(Beacon(deviceID: id, host: host, port: port, fingerprintPrefix: fp,
-                             name: String(decoding: nameData, as: UTF8.self)))
+                             name: BHDS.cleanName(String(decoding: nameData, as: UTF8.self))))
         }
     }
 }

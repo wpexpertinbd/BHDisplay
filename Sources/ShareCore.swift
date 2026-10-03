@@ -10,7 +10,15 @@ enum BHDS {
     static let udpPort: UInt16 = 24861
     static let maxFrame = 1_048_576
     static let maxClipboard = 256 * 1024
-    static let version: UInt8 = 1
+    static let version: UInt8 = 2
+
+    /// A peer-supplied name for logs and dialogs: no control or invisible formatting characters (newlines,
+    /// right-to-left overrides) that could forge log lines or disguise the name.
+    static func cleanName(_ s: String) -> String {
+        let kept = s.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) && $0.properties.generalCategory != .format }
+        let t = String(String.UnicodeScalarView(kept)).trimmingCharacters(in: .whitespaces)
+        return t.isEmpty ? "unnamed computer" : t
+    }
 }
 
 enum WireError: Error, CustomStringConvertible {
@@ -51,9 +59,33 @@ struct WireReader {
 
 // MARK: - Identity
 
-/// Long-term device identity: a random device id and a P-256 signing key, created once and kept in a
-/// 0600 file under Application Support (not the Keychain: an ad-hoc-signed app's keychain items re-prompt
-/// on every new build).
+/// Secrets kept in the login Keychain, readable without a prompt only by this app (its code signature):
+/// other programs running as the same user can't copy the identity key or add themselves to the paired list.
+enum ShareKeychain {
+    private static let service = "com.biswashost.bhdisplay.sharing"
+
+    static func read(_ account: String) -> Data? {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                kSecAttrAccount as String: account, kSecReturnData as String: true,
+                                kSecMatchLimit as String: kSecMatchLimitOne]
+        var out: CFTypeRef?
+        return SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess ? out as? Data : nil
+    }
+
+    @discardableResult
+    static func write(_ account: String, _ data: Data) -> Bool {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                kSecAttrAccount as String: account]
+        if SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary) == errSecSuccess { return true }
+        var add = q
+        add[kSecValueData as String] = data
+        add[kSecAttrLabel as String] = "BHDisplay keyboard & mouse sharing"
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+}
+
+/// Long-term device identity: a random device id and a P-256 signing key, created once and kept in the
+/// Keychain. (Earlier builds kept it in a 0600 file; it is moved into the Keychain and the file deleted.)
 final class ShareIdentity: @unchecked Sendable {   // immutable after init
     let deviceID: Data
     let signingKey: P256.Signing.PrivateKey
@@ -71,27 +103,31 @@ final class ShareIdentity: @unchecked Sendable {   // immutable after init
     }
     #endif
 
-    static var fileURL: URL {
+    static var legacyFileURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("BHDisplay", isDirectory: true).appendingPathComponent("identity")
     }
 
+    private static func parse(_ d: Data, name: String) -> ShareIdentity? {
+        guard d.count == 48, let key = try? P256.Signing.PrivateKey(rawRepresentation: d.subdata(in: 16..<48)) else { return nil }
+        return ShareIdentity(deviceID: d.subdata(in: 0..<16), key: key, name: name)
+    }
+
     static func loadOrCreate() throws -> ShareIdentity {
         let name = String((Host.current().localizedName ?? "Mac").prefix(64))
-        let url = fileURL
-        if let d = try? Data(contentsOf: url), d.count == 48,
-           let key = try? P256.Signing.PrivateKey(rawRepresentation: d.subdata(in: 16..<48)) {
-            return ShareIdentity(deviceID: d.subdata(in: 0..<16), key: key, name: name)
+        if let d = ShareKeychain.read("identity"), let id = parse(d, name: name) { return id }
+        // Move an identity from the old file into the Keychain (keeps existing pairings working).
+        let file = legacyFileURL
+        if let d = try? Data(contentsOf: file), let id = parse(d, name: name) {
+            guard ShareKeychain.write("identity", d) else { throw WireError.bad("cannot save the sharing key in the Keychain") }
+            try? FileManager.default.removeItem(at: file)
+            return id
         }
-        let dir = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         var id = Data(count: 16)
         guard id.withUnsafeMutableBytes({ SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }) == errSecSuccess
         else { throw WireError.bad("no randomness") }
         let key = P256.Signing.PrivateKey()
-        let blob = id + key.rawRepresentation
-        guard FileManager.default.createFile(atPath: url.path, contents: blob, attributes: [.posixPermissions: 0o600])
-        else { throw WireError.bad("cannot write \(url.path)") }
+        guard ShareKeychain.write("identity", id + key.rawRepresentation) else { throw WireError.bad("cannot save the sharing key in the Keychain") }
         return ShareIdentity(deviceID: id, key: key, name: name)
     }
 }
@@ -130,7 +166,7 @@ struct Hello {
         let id = try r.bytes(16), ik = try r.bytes(65), ek = try r.bytes(65), nonce = try r.bytes(32)
         let n = Int(try r.u8())
         guard n <= 64 else { throw WireError.bad("name too long") }
-        let name = String(decoding: try r.bytes(n), as: UTF8.self)
+        let name = BHDS.cleanName(String(decoding: try r.bytes(n), as: UTF8.self))
         guard r.remaining == 0 else { throw WireError.bad("trailing bytes in HELLO") }
         // Validate both keys are real P-256 points before anything uses them.
         _ = try P256.Signing.PublicKey(x963Representation: ik)
@@ -147,7 +183,13 @@ struct HandshakeKeys {
 
 enum Handshake {
     static func transcript(dialerHello: Data, listenerHello: Data) -> Data {
-        Data(SHA256.hash(data: Data("BHDS-v1".utf8) + dialerHello + listenerHello))
+        Data(SHA256.hash(data: Data("BHDS-v2".utf8) + dialerHello + listenerHello))
+    }
+
+    /// The listener's commitment to its HELLO, sent before it sees the dialer's: neither side can then choose
+    /// its HELLO to steer the pairing code (an attacker in the middle could otherwise make both codes match).
+    static func commitment(listenerHello: Data) -> Data {
+        Data(SHA256.hash(data: Data("BHDS-v2 commit".utf8) + listenerHello))
     }
 
     static func authMessage(role: UInt8, transcript t: Data) -> Data { Data("BHDS-auth".utf8) + [role] + t }
@@ -168,10 +210,10 @@ enum Handshake {
         let peer = try P256.KeyAgreement.PublicKey(x963Representation: peerEphemeral)
         let z = try ephemeral.sharedSecretFromKeyAgreement(with: peer)
         let ikm = z.withUnsafeBytes { SymmetricKey(data: Data($0)) }
-        let k = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: t, info: Data("BHDS-v1 keys".utf8), outputByteCount: 64)
+        let k = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: t, info: Data("BHDS-v2 keys".utf8), outputByteCount: 64)
             .withUnsafeBytes { Data($0) }
         let d2l = SymmetricKey(data: k.subdata(in: 0..<32)), l2d = SymmetricKey(data: k.subdata(in: 32..<64))
-        let p = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: t, info: Data("BHDS-v1 pair".utf8), outputByteCount: 4)
+        let p = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: t, info: Data("BHDS-v2 pair".utf8), outputByteCount: 4)
             .withUnsafeBytes { Data($0) }
         let code = p.reduce(UInt32(0)) { $0 << 8 | UInt32($1) } % 1_000_000
         return HandshakeKeys(send: isDialer ? d2l : l2d, receive: isDialer ? l2d : d2l,

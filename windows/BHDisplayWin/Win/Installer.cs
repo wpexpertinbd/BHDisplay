@@ -29,8 +29,13 @@ internal static class Installer
         {
             if (!StopRunningCopy()) { Tell("BHDisplay is still running and didn't close. Quit it from the tray icon, then run this file again.", true); return; }
             Directory.CreateDirectory(InstallDir);
+            bool firstInstall = Registry.CurrentUser.OpenSubKey(UninstallKey) is null;
+            bool autostart;
+            using (var r = Registry.CurrentUser.OpenSubKey(RunKey)) autostart = r?.GetValue("BHDisplay") is string;
             CopyWithRetry(Environment.ProcessPath!, InstalledExe);
-            using (var run = Registry.CurrentUser.CreateSubKey(RunKey)) run.SetValue("BHDisplay", $"\"{InstalledExe}\"");
+            // Start with Windows: on for a new install; on an update keep whatever the user chose.
+            if (firstInstall || autostart)
+                using (var run = Registry.CurrentUser.CreateSubKey(RunKey)) run.SetValue("BHDisplay", $"\"{InstalledExe}\"");
             using (var u = Registry.CurrentUser.CreateSubKey(UninstallKey))
             {
                 u.SetValue("DisplayName", "BHDisplay");
@@ -66,11 +71,13 @@ internal static class Installer
         try { using var run = Registry.CurrentUser.OpenSubKey(RunKey, true); run?.DeleteValue("BHDisplay", false); } catch { }
         try { Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false); } catch { }
         try { File.Delete(Shortcut); } catch { }
-        // This process runs from the folder being removed: delete it a moment after we exit.
-        var dirs = $"\"{InstallDir}\" \"{Settings.Dir}\"";
-        Process.Start(new ProcessStartInfo("cmd.exe", $"/c ping 127.0.0.1 -n 3 >nul & rmdir /s /q {dirs}")
-            { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden });
         Tell("BHDisplay has been removed.", false);
+        // This process runs from the folder being removed: delete it a moment after we exit (we exit right after
+        // starting this, so the exe is no longer locked). Full System32 paths: nothing is looked up elsewhere.
+        var sys = Environment.SystemDirectory;
+        var dirs = $"\"{InstallDir}\" \"{Settings.Dir}\"";
+        Process.Start(new ProcessStartInfo(Path.Combine(sys, "cmd.exe"), $"/c \"{Path.Combine(sys, "PING.EXE")}\" 127.0.0.1 -n 3 >nul & rmdir /s /q {dirs}")
+            { CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden, WorkingDirectory = sys });
     }
 
     /// Asks a running BHDisplay to quit and waits until it has. True when none is running any more.

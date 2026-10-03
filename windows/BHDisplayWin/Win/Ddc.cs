@@ -79,6 +79,7 @@ internal sealed class Settings
             if (!Ddc.IsInput(s.MacPort)) s.MacPort = 0x12;    // never trust a hand-edited value
             if (!Ddc.IsInput(s.PcPort)) s.PcPort = 0x0F;
             if (s.MacEdge is not (0 or 1)) s.MacEdge = 0;
+            s.Paired = s.Paired.Where(kv => kv.Key.Length == 64 && kv.Key.All(Uri.IsHexDigit)).ToDictionary();
             s.PeerHosts = s.PeerHosts.Where(kv => System.Net.IPAddress.TryParse(kv.Value, out var a)
                 && a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToDictionary();
             return s;

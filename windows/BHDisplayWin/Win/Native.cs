@@ -52,6 +52,10 @@ internal static partial class Native
     // ---- hotkeys ----
     public const uint MOD_ALT = 1, MOD_CONTROL = 2, MOD_WIN = 8, MOD_NOREPEAT = 0x4000;
     public const int WM_HOTKEY = 0x312;
+    public const int WM_WTSSESSION_CHANGE = 0x2B1;
+    public const int WTS_CONSOLE_DISCONNECT = 2, WTS_REMOTE_DISCONNECT = 4, WTS_SESSION_LOCK = 7, WTS_SESSION_UNLOCK = 8;
+    [LibraryImport("wtsapi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool WTSRegisterSessionNotification(nint hWnd, uint dwFlags);
+    [LibraryImport("wtsapi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool WTSUnRegisterSessionNotification(nint hWnd);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool RegisterHotKey(nint hWnd, int id, uint mods, uint vk);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool UnregisterHotKey(nint hWnd, int id);
 

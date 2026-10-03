@@ -90,7 +90,7 @@ public sealed class ShareSession
     {
         var idle = Environment.TickCount64 - Interlocked.Read(ref _lastReceive);
         if (_open) { if (idle > 6000) Close("peer stopped responding"); else Send(new ShareMsg.Ping()); }
-        else if (idle > 10000) Close("handshake timed out");
+        else if (idle > 5000) Close("handshake timed out");
     }
 
     private async Task WriteFrameAsync(byte[] body)
@@ -106,7 +106,8 @@ public sealed class ShareSession
         var head = new byte[4];
         await _stream.ReadExactlyAsync(head, _cts.Token);
         var n = BinaryPrimitives.ReadUInt32BigEndian(head);
-        if (n < 1 || n > Bhds.MaxFrame) throw new WireException("bad frame length");
+        // Before authentication only small handshake frames are allowed (no large allocation for strangers).
+        if (n < 1 || n > (_open ? Bhds.MaxFrame : 512)) throw new WireException("bad frame length");
         var body = new byte[n];
         await _stream.ReadExactlyAsync(body, _cts.Token);
         Interlocked.Exchange(ref _lastReceive, Environment.TickCount64);
@@ -120,13 +121,24 @@ public sealed class ShareSession
     {
         try
         {
-            if (Role == Role.Dialer) { _myHello = MakeHello(); await WriteFrameAsync(_myHello); }
+            // Listener commits to its HELLO first; the dialer sends its HELLO only after receiving that.
+            byte[] peerCommit = [];
+            _myHello = MakeHello();
+            if (Role == Role.Listener) await WriteFrameAsync(Handshake.Commitment(_myHello));
+            else
+            {
+                peerCommit = await ReadFrameAsync();
+                if (peerCommit.Length != 32) throw new WireException("bad commitment");
+                await WriteFrameAsync(_myHello);
+            }
 
             var peerHello = await ReadFrameAsync();
             var h = Hello.Decode(peerHello);
             if (h.DeviceId.AsSpan().SequenceEqual(_identity.DeviceId)) throw new WireException("connected to itself");
+            if (Role == Role.Dialer && !CryptographicOperations.FixedTimeEquals(Handshake.Commitment(peerHello), peerCommit))
+                throw new WireException("peer's HELLO doesn't match its commitment");
             Peer = h;
-            if (Role == Role.Listener) { _myHello = MakeHello(); await WriteFrameAsync(_myHello); }
+            if (Role == Role.Listener) await WriteFrameAsync(_myHello);
             _transcript = Role == Role.Dialer ? Handshake.Transcript(_myHello, peerHello) : Handshake.Transcript(peerHello, _myHello);
             await WriteFrameAsync(Handshake.Sign(_identity, Role == Role.Dialer ? (byte)0 : (byte)1, _transcript));
 
@@ -207,11 +219,17 @@ public sealed class ShareDiscovery
         _timer = new Timer(_ => { foreach (var t in BroadcastTargets()) Send(t); }, null, 0, 2000);
         _ = Task.Run(async () =>
         {
+            long windowStart = 0; int windowCount = 0;
             while (_udp is { } c)
             {
                 try
                 {
                     var r = await c.ReceiveAsync();
+                    // A flood of (spoofed) beacons must not reach the UI thread, where the input hooks run:
+                    // a real peer sends one every 2 s, so 20 a second overall is generous.
+                    var now = Environment.TickCount64;
+                    if (now - windowStart >= 1000) { windowStart = now; windowCount = 0; }
+                    if (++windowCount > 20) continue;
                     if (TryParse(r.Buffer, r.RemoteEndPoint.Address.ToString(), id.DeviceId) is { } b)
                     {
                         Reply(r.RemoteEndPoint.Address);
@@ -236,6 +254,7 @@ public sealed class ShareDiscovery
         var key = host.ToString(); var now = Environment.TickCount64;
         lock (_lastReply)
         {
+            if (_lastReply.Count > 256) _lastReply.Clear();         // bounded: senders can be spoofed
             if (_lastReply.TryGetValue(key, out var t) && now - t < 5000) return;
             _lastReply[key] = now;
         }
@@ -277,7 +296,7 @@ public sealed class ShareDiscovery
             if (id.AsSpan().SequenceEqual(ownId)) return null;
             var port = r.U16(); var fp = r.Bytes(8).ToArray();
             int nl = r.U8(); if (nl > 64) return null;
-            return new Beacon(id, host, port, fp, Encoding.UTF8.GetString(r.Bytes(nl)));
+            return new Beacon(id, host, port, fp, Bhds.CleanName(Encoding.UTF8.GetString(r.Bytes(nl))));
         }
         catch (WireException) { return null; }
     }

@@ -188,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private let m = MonitorModel.shared
 
     func applicationWillTerminate(_ n: Notification) {
+        ShareController.shared.stop()             // release capture and any keys/buttons we pressed for the peer
         DisplayPower.turnOn()                     // never leave the shared monitor without the Mac's signal
     }
 
@@ -282,6 +283,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if share.enabled {
             let st = NSMenuItem(title: "    " + share.status, action: nil, keyEquivalent: ""); st.isEnabled = false
             menu.addItem(st)
+            let arm = NSMenuItem(title: "    Pair a new computer…", action: #selector(armPairing), keyEquivalent: ""); arm.target = self
+            menu.addItem(arm)
             for d in share.discovered {
                 let p = NSMenuItem(title: "    Pair with \(d.name)…", action: #selector(pairDevice(_:)), keyEquivalent: ""); p.target = self
                 p.representedObject = d.id
@@ -307,6 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         share.enabled.toggle()
         if share.enabled && share.needsAccessibility { showWindow() }
     }
+    @objc private func armPairing() { ShareController.shared.armPairing() }
     @objc private func pairDevice(_ item: NSMenuItem) {
         let share = ShareController.shared
         if let id = item.representedObject as? String, let d = share.discovered.first(where: { $0.id == id }) { share.pair(with: d) }
@@ -354,12 +358,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let id = Int(hk.id)
             DispatchQueue.main.async {
                 let m = MonitorModel.shared
-                if id == 9 { m.toggleMacOther() }
+                if id == 10 { ShareController.shared.takeBack() }
+                else if id == 9 { m.toggleMacOther() }
                 else if MonitorInput.all.indices.contains(id - 1) { m.switchTo(MonitorInput.all[id - 1].id) }
             }
             return noErr
         }, 1, &spec, nil, nil)
-        let keys: [(Int, UInt32)] = [(kVK_ANSI_1, 1), (kVK_ANSI_2, 2), (kVK_ANSI_3, 3), (kVK_ANSI_S, 9)]
+        let keys: [(Int, UInt32)] = [(kVK_ANSI_1, 1), (kVK_ANSI_2, 2), (kVK_ANSI_3, 3), (kVK_ANSI_S, 9), (kVK_Escape, 10)]
         for (k, id) in keys {
             var ref: EventHotKeyRef?
             RegisterEventHotKey(UInt32(k), UInt32(controlKey | optionKey | cmdKey),

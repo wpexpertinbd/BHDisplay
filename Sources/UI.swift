@@ -253,6 +253,8 @@ struct ContentView: View {
                             Button("Pair…") { share.pair(with: d) }.controlSize(.small)
                         }
                     }
+                    Button("Pair a new computer…") { share.armPairing() }.controlSize(.small)
+                        .help("For 2 minutes this Mac accepts a pairing request. Nothing can pair with it otherwise.")
                     ForEach(share.paired.sorted(by: { $0.value < $1.value }), id: \.key) { fp, name in
                         HStack {
                             Image(systemName: "checkmark.seal.fill").foregroundStyle(accent)

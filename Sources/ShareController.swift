@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import Combine
 import CryptoKit
 
@@ -41,6 +42,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     private var pairing: (session: ShareSession, local: Bool, remote: Bool)?
     private var dialing: Set<String> = []
     private var lastPairPrompt = Date.distantPast
+    private var promptOpen = false                      // never stack pairing prompts
     private var peerHosts: [String: String] = UserDefaults.standard.dictionary(forKey: "sharePeerHosts") as? [String: String] ?? [:]
     private var timers: [Timer] = []
     private var inputWatch: AnyCancellable?
@@ -48,6 +50,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     private var showsPeer = false                    // the shared monitor currently shows the peer
     private var suppressUntil = Date.distantPast     // after ⌃⌥⌘Esc: don't re-capture for a moment
     private var lastHandover = Date.distantPast       // no bouncing straight back across the boundary
+    private var lastSecureNotice = Date.distantPast
 
     private override init() {
         let d = UserDefaults.standard
@@ -55,7 +58,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         swapCmdCtrl = d.object(forKey: "shareSwapCmdCtrl") as? Bool ?? true
         peerMouseSpeed = min(max(d.object(forKey: "sharePeerMouseSpeed") as? Double ?? 1, 0.5), 3)
         peerScrollSpeed = min(max(d.object(forKey: "sharePeerScrollSpeed") as? Double ?? 1, 0.5), 5)
-        paired = d.dictionary(forKey: "sharePaired") as? [String: String] ?? [:]
+        paired = ShareController.loadPaired()
         super.init()
         capture.delegate = self
         capture.swapCmdCtrl = swapCmdCtrl; emulator.swapCmdCtrl = swapCmdCtrl; emulator.speed = peerMouseSpeed; emulator.scrollSpeed = peerScrollSpeed
@@ -81,7 +84,12 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         LegacyCleanup.removeOldSharingJob()
         ShareLog.write("sharing on (\(identity.name))")
 
-        listener.onSession = { [weak self] s in self?.q.async { self?.adopt(s) } }
+        listener.onSession = { [weak self] s in
+            // Sharing is between two computers: a connection from this Mac itself is never a peer.
+            let h = s.remoteHost
+            if h.hasPrefix("127.") || h.hasPrefix("::1") || h.hasPrefix("::ffff:127.") { s.close("refused: connection from this Mac"); return }
+            self?.q.async { self?.adopt(s) }
+        }
         listener.onError = { [weak self] e in Task { @MainActor in self?.listenerFailed(e) } }
         listener.start(identity: identity, queue: q)
         discovery.onBeacon = { [weak self] b in Task { @MainActor in self?.beacon(b) } }
@@ -89,6 +97,14 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         running = true
         timers = [
             Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.reconnectKnownPeers() } },
+            // Secure keyboard entry switched on while forwarding: keys would go to the Mac app — stop forwarding.
+            Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.controlling, IsSecureEventInputEnabled() else { return }
+                    ShareLog.write("secure keyboard entry turned on: keyboard back to this Mac")
+                    self.stopControlling(warpTo: self.layout()?.besideShared(0.5))
+                }
+            },
             // Notice switches made with the monitor's own buttons or by its Auto Detect.
             Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { if self?.session != nil { MonitorModel.shared.refresh(full: false) } }
@@ -210,6 +226,16 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     @discardableResult
     private func startControlling(position: Float, takeover: Bool, layout lay: ShareLayout) -> Bool {
         guard running, let s = session, Date() > suppressUntil else { return false }
+        // Secure keyboard entry (a password field, Terminal's Secure Keyboard Entry) hides key events from us:
+        // forwarding then would send the mouse across but type into the Mac app. Don't start.
+        if IsSecureEventInputEnabled() {
+            if Date().timeIntervalSince(lastSecureNotice) > 10 {
+                lastSecureNotice = Date()
+                ShareLog.write("not crossing: secure keyboard entry is on in a Mac app")
+                status = "Can't share the keyboard while a password field or Secure Keyboard Entry is active on this Mac"
+            }
+            return false
+        }
         if let text = clipboard.takeOutgoing() { s.send(.clipboard(text)) }
         s.send(.enter(edge: takeover ? 4 : (lay.sharedOnRight ? 0 : 1), position: position))
         capture.begin(parkAt: takeover ? nil : lay.besideShared(position))
@@ -238,12 +264,12 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         let key = b.deviceID.hex
         if isPaired(prefix: b.fingerprintPrefix) {
             discovered.removeAll { $0.id == key }
-            if session == nil, identity.deviceID.lexicographicallyPrecedes(b.deviceID), !dialing.contains(b.host) {
-                dial(host: b.host, port: b.port)
+            if session == nil, identity.deviceID.lexicographicallyPrecedes(b.deviceID), !dialing.contains(b.host), dialing.count < 4 {
+                dial(host: b.host, port: BHDS.tcpPort)              // only ever our own port, whatever a beacon claims
             }
         } else if let i = discovered.firstIndex(where: { $0.id == key }) {
             discovered[i].lastSeen = Date()
-        } else {
+        } else if discovered.count < 16 {                        // bounded: beacons are unauthenticated
             discovered.append(Device(id: key, name: b.name, host: b.host, port: b.port, fpPrefix: b.fingerprintPrefix, lastSeen: Date()))
             ShareLog.write("found \(b.name) at \(b.host)")
         }
@@ -264,28 +290,62 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         for (fp, host) in peerHosts where paired[fp] != nil && !dialing.contains(host) { dial(host: host, port: BHDS.tcpPort) }
     }
 
-    func pair(with d: Device) { dial(host: d.host, port: d.port) }
+    /// New pairings are accepted only for 2 minutes after the user asks for one on THIS computer — a stranger
+    /// on the network can never make a pairing prompt appear out of the blue.
+    @Published private(set) var pairArmedUntil = Date.distantPast
+    var pairingArmed: Bool { Date() < pairArmedUntil }
+    func armPairing() {
+        pairArmedUntil = Date().addingTimeInterval(120)
+        ShareLog.write("ready to pair a new computer for 2 minutes")
+        updateStatus()
+        q.asyncAfter(deadline: .now() + 121) { [weak self] in Task { @MainActor in self?.updateStatus() } }
+    }
+
+    func pair(with d: Device) { armPairing(); dial(host: d.host, port: BHDS.tcpPort) }
 
     func connect(toHost host: String) {
         guard running, !host.isEmpty else { return }
+        armPairing()
         dial(host: host, port: BHDS.tcpPort)
         status = "Connecting to \(host)…"
     }
 
     func forget(_ fingerprintHex: String) {
         paired.removeValue(forKey: fingerprintHex)
-        UserDefaults.standard.set(paired, forKey: "sharePaired")
+        ShareController.savePaired(paired)
         peerHosts.removeValue(forKey: fingerprintHex)
         UserDefaults.standard.set(peerHosts, forKey: "sharePeerHosts")
         if session?.peerFingerprint.hex == fingerprintHex { session?.close("forgotten") }
+    }
+
+    /// The paired list lives in the Keychain: a program that can only write our preferences can't add itself.
+    private static func loadPaired() -> [String: String] {
+        if let d = ShareKeychain.read("paired"), let p = try? JSONDecoder().decode([String: String].self, from: d) {
+            return p.filter { Data(hexString: $0.key)?.count == 32 }
+        }
+        // One-time move from the preferences file used by earlier builds.
+        let old = UserDefaults.standard.dictionary(forKey: "sharePaired") as? [String: String] ?? [:]
+        let valid = old.filter { Data(hexString: $0.key)?.count == 32 }
+        if savePaired(valid) { UserDefaults.standard.removeObject(forKey: "sharePaired") }
+        return valid
+    }
+
+    @discardableResult
+    private static func savePaired(_ p: [String: String]) -> Bool {
+        guard let d = try? JSONEncoder().encode(p) else { return false }
+        return ShareKeychain.write("paired", d)
     }
 
     nonisolated private func adopt(_ s: ShareSession) {
         s.onReady = { [weak self] s in Task { @MainActor in self?.ready(s) } }
         s.onMessage = { [weak self] s, m in Task { @MainActor in self?.received(m, from: s) } }
         s.onClose = { [weak self] s, why in Task { @MainActor in self?.closed(s, why) } }
-        Task { @MainActor in self.pending[ObjectIdentifier(s)] = s }
-        s.start()
+        Task { @MainActor in
+            // At most a few handshakes at a time: strangers can't pile up connections.
+            guard self.pending.count < 8 else { s.close("too many connections"); return }
+            self.pending[ObjectIdentifier(s)] = s
+            s.start()
+        }
     }
 
     private func isPreferred(_ s: ShareSession) -> Bool {
@@ -301,6 +361,10 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             if let old = session, old !== s {
                 // Both sides may dial at once: keep the one dialed by the lower device id (both apply this rule).
                 guard isPreferred(s) else { s.close("duplicate connection"); return }
+                // The old session's close callback will find it is no longer current and do nothing,
+                // so release everything it carried now — never keep capturing for a session that is gone.
+                if controlling { capture.end(warpTo: layout()?.besideShared(0.5)); controlling = false }
+                if controlled { emulator.leave(); controlled = false }
                 old.close("duplicate connection")
             }
             session = s
@@ -315,7 +379,8 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             updateStatus()
             return
         }
-        guard pairing == nil, Date().timeIntervalSince(lastPairPrompt) > 5 else { s.close("busy pairing"); return }
+        guard pairingArmed else { s.close("not accepting new pairings"); return }
+        guard pairing == nil, !promptOpen, Date().timeIntervalSince(lastPairPrompt) > 5 else { s.close("busy pairing"); return }
         lastPairPrompt = Date()
         pairing = (s, false, false)
         q.asyncAfter(deadline: .now() + 60) { [weak self] in
@@ -327,6 +392,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     private func promptPairing(_ s: ShareSession) {
         let name = s.peer?.name ?? "another computer"
         let code = s.pairCode.prefix(3) + " " + s.pairCode.suffix(3)
+        let sameName = paired.values.contains(name)
+            ? "\n\n⚠️ A computer named “\(name)” is already paired — this is a DIFFERENT computer using that name."
+            : ""
         NSApp.activate()
         let a = NSAlert()
         a.messageText = "Pair with “\(name)”?"
@@ -335,12 +403,22 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
 
         Pairing code:  \(code)
 
-        Pair only if the other computer shows exactly the same code. Once paired, its keyboard and mouse can control this Mac.
+        Pair only if the other computer shows exactly the same code. Once paired, its keyboard and mouse can control this Mac.\(sameName)
         """
         a.addButton(withTitle: "Pair")
         a.addButton(withTitle: "Don't Pair")
         a.alertStyle = .warning
+        // No key answers "Pair" (a stray Return must never pair), and it can't be clicked for the first 1.5 s.
+        let pairButton = a.buttons[0]
+        pairButton.keyEquivalent = ""
+        a.buttons[1].keyEquivalent = "\u{1b}"
+        pairButton.isEnabled = false
+        let enable = Timer(timeInterval: 1.5, repeats: false) { _ in pairButton.isEnabled = true }
+        RunLoop.main.add(enable, forMode: .modalPanel)
+        promptOpen = true
         let ok = a.runModal() == .alertFirstButtonReturn
+        promptOpen = false
+        enable.invalidate()
         guard pairing?.session === s else { return }
         if ok {
             pairing?.local = true
@@ -356,8 +434,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         guard let p = pairing, p.local, p.remote else { return }
         let s = p.session
         pairing = nil
+        pairArmedUntil = .distantPast
         paired[s.peerFingerprint.hex] = s.peer?.name ?? "Computer"
-        UserDefaults.standard.set(paired, forKey: "sharePaired")
+        ShareController.savePaired(paired)
         ShareLog.write("paired with \(s.peer?.name ?? "?")")
         ready(s)
     }
@@ -389,7 +468,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             if controlling { capture.end(warpTo: nil); controlling = false }
             // Shows the peer: its pointer comes off the shared monitor onto our screens. Shows this Mac: it comes
             // in at the outer edge on the shared monitor's side. (Edge 4 = old take-over: pointer stays put.)
-            emulator.enter(position: pos, layout: edge == 4 ? nil : showsPeer ? layout() : outerLayout())
+            emulator.enter(position: pos, layout: edge == 4 ? nil : showsPeer ? (layout() ?? outerLayout()) : outerLayout())
             controlled = true
             lastHandover = Date()
             ShareLog.write("← \(connectedName ?? "peer") is controlling this Mac (\(edge == 4 ? "take-over" : "came across"))")
@@ -447,13 +526,25 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         MainActor.assumeIsolated {
             guard showsPeer, Date().timeIntervalSince(lastHandover) > 0.25, let lay = layout() else { return false }
             lastHandover = Date()
+            let hadPeer = controlled
             if controlled { emulator.leave(); controlled = false }   // our own mouse wins: the peer's pointer was here
-            return startControlling(position: position, takeover: false, layout: lay)
+            let ok = startControlling(position: position, takeover: false, layout: lay)
+            // We let go of the peer's pointer: if we didn't take over its screen instead, tell it, or it keeps
+            // capturing into nothing.
+            if !ok && hadPeer { session?.send(.leave(edge: 4, position: 0.5)) }
+            return ok
         }
     }
 
     nonisolated func captured(_ msg: ShareMsg) {
         MainActor.assumeIsolated { if controlling { session?.send(msg) } }
+    }
+
+    /// ⌃⌥⌘Esc from the Carbon hot key (works even under secure keyboard entry, where the event tap sees no keys).
+    func takeBack() {
+        guard controlling else { return }
+        suppressUntil = Date().addingTimeInterval(5)
+        stopControlling(warpTo: layout()?.besideShared(0.5))
     }
 
     nonisolated func captureLocalHotkey(_ keyCode: UInt16) {
@@ -473,7 +564,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
 
     private func updateStatus() {
         guard running else { return }
-        if let n = connectedName {
+        if pairingArmed && pairing == nil {
+            status = "Ready to pair — choose “Pair” on the other computer now (2 minutes)"
+        } else if let n = connectedName {
             status = controlling ? "Typing on \(n) — ⌃⌥⌘Esc takes it back"
                 : controlled ? "\(n)'s keyboard & mouse are on this Mac"
                 : showsPeer ? "Connected to \(n) — move onto the monitor to use it" : "Connected to \(n)"

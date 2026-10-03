@@ -28,6 +28,16 @@ internal sealed class Capture : IDisposable
 
     public Capture() { _kbProc = KeyboardProc; _msProc = MouseProc; }
 
+    /// Windows silently removes a low-level hook that once took too long: re-install on demand.
+    public bool Restart()
+    {
+        if (Capturing) return true;
+        if (_kb != 0) UnhookWindowsHookEx(_kb);
+        if (_ms != 0) UnhookWindowsHookEx(_ms);
+        _kb = _ms = 0;
+        return Start();
+    }
+
     public bool Start()
     {
         if (_kb != 0) return true;
@@ -43,7 +53,9 @@ internal sealed class Capture : IDisposable
         Capturing = true;
         _park = Screens.Center(Edge);                      // away from edges so deltas never clamp
         SetCursorPos(_park.X, _park.Y);
-        _ctrl = _alt = _win = false;
+        _ctrl = (GetAsyncKeyState(0x11) & 0x8000) != 0;    // VK_CONTROL / VK_MENU / VK_LWIN, VK_RWIN
+        _alt = (GetAsyncKeyState(0x12) & 0x8000) != 0;
+        _win = (GetAsyncKeyState(0x5B) & 0x8000) != 0 || (GetAsyncKeyState(0x5C) & 0x8000) != 0;
         _heldHere.RemoveWhere(vk => (GetAsyncKeyState((int)vk) & 0x8000) == 0);   // drop any missed release
     }
 
@@ -58,6 +70,10 @@ internal sealed class Capture : IDisposable
         }
     }
 
+    // Dragging across would leave the button "down" here (its release would go to the Mac).
+    private static bool AnyButtonDown() =>
+        new[] { 0x01, 0x02, 0x04, 0x05, 0x06 }.Any(vk => (GetAsyncKeyState(vk) & 0x8000) != 0);
+
     private nint MouseProc(int nCode, nint wParam, nint lParam)
     {
         if (nCode < 0) return CallNextHookEx(_ms, nCode, wParam, lParam);
@@ -71,7 +87,7 @@ internal sealed class Capture : IDisposable
             {
                 var towards = Edge == 0 ? m.pt.X <= _last.X : m.pt.X >= _last.X;
                 _last = m.pt;
-                if (WatchEdge && towards && Screens.Hit(m.pt, Edge) is { } pos && EdgeHit?.Invoke(pos) == true)
+                if (WatchEdge && towards && !AnyButtonDown() && Screens.Hit(m.pt, Edge) is { } pos && EdgeHit?.Invoke(pos) == true)
                 {
                     Begin(m.pt.Y);
                     return 1;
@@ -177,10 +193,13 @@ internal sealed class Emulator
     {
         if (!Active) return;
         GetCursorPos(out var cur);
-        var p = Screens.Clamp(new POINT { X = cur.X + dx, Y = cur.Y + dy });
+        var target = new POINT { X = cur.X + dx, Y = cur.Y + dy };
+        var p = Screens.Clamp(target);
         MoveTo(p);
         bool pushingOut = _handBack && (Edge == 0 ? dx < 0 : dx > 0);
-        if (pushingOut && Screens.Hit(p, Edge) is { } pos) { Leave(); Left?.Invoke(pos); }
+        // Decide from where the Mac's mouse is sending the pointer, so hand-back works even when the real cursor
+        // can't move (lock screen, an app confining it).
+        if (pushingOut && (Screens.Hit(target, Edge) ?? Screens.Hit(p, Edge)) is { } pos) { Leave(); Left?.Invoke(pos); }
     }
 
     public void Button(byte b, bool down)

@@ -12,7 +12,15 @@ public static class Bhds
     public const int UdpPort = 24861;
     public const int MaxFrame = 1_048_576;
     public const int MaxClipboard = 256 * 1024;
-    public const byte Version = 1;
+    public const byte Version = 2;
+
+    /// A peer-supplied name for logs and dialogs: no control or invisible formatting characters (newlines,
+    /// right-to-left overrides) that could forge log lines or disguise the name.
+    public static string CleanName(string s)
+    {
+        var t = new string(s.Where(c => !char.IsControl(c) && char.GetUnicodeCategory(c) != System.Globalization.UnicodeCategory.Format).ToArray()).Trim();
+        return t.Length == 0 ? "unnamed computer" : t;
+    }
     public static readonly byte[] HelloMagic = "BHDS"u8.ToArray();
     public static readonly byte[] BeaconMagic = "BHDS1"u8.ToArray();
 }
@@ -139,7 +147,7 @@ public sealed record Hello(byte[] DeviceId, byte[] IdentityKey, byte[] Ephemeral
         var nonce = r.Bytes(32).ToArray();
         int n = r.U8();
         if (n > 64) throw new WireException("name too long");
-        var name = Encoding.UTF8.GetString(r.Bytes(n));
+        var name = Bhds.CleanName(Encoding.UTF8.GetString(r.Bytes(n)));
         if (r.Remaining != 0) throw new WireException("trailing bytes in HELLO");
         P256.Import(ik); P256.Import(ek);   // both must be real curve points
         return new Hello(id, ik, ek, nonce, name);
@@ -151,7 +159,11 @@ public sealed record HandshakeKeys(byte[] Send, byte[] Receive, string PairCode)
 public static class Handshake
 {
     public static byte[] Transcript(byte[] dialerHello, byte[] listenerHello) =>
-        SHA256.HashData([.. "BHDS-v1"u8, .. dialerHello, .. listenerHello]);
+        SHA256.HashData([.. "BHDS-v2"u8, .. dialerHello, .. listenerHello]);
+
+    /// The listener's commitment to its HELLO, sent before it sees the dialer's: neither side can then choose
+    /// its HELLO to steer the pairing code (an attacker in the middle could otherwise make both codes match).
+    public static byte[] Commitment(byte[] listenerHello) => SHA256.HashData([.. "BHDS-v2 commit"u8, .. listenerHello]);
 
     static byte[] AuthMessage(byte role, byte[] t) => [.. "BHDS-auth"u8, role, .. t];
 
@@ -174,8 +186,8 @@ public static class Handshake
     {
         using var peer = ECDiffieHellman.Create(P256.Import(peerEphemeral));
         var z = ephemeral.DeriveRawSecretAgreement(peer.PublicKey);    // x-coordinate, as CryptoKit's SharedSecret
-        var k = HKDF.DeriveKey(HashAlgorithmName.SHA256, z, 64, t, "BHDS-v1 keys"u8.ToArray());
-        var p = HKDF.DeriveKey(HashAlgorithmName.SHA256, z, 4, t, "BHDS-v1 pair"u8.ToArray());
+        var k = HKDF.DeriveKey(HashAlgorithmName.SHA256, z, 64, t, "BHDS-v2 keys"u8.ToArray());
+        var p = HKDF.DeriveKey(HashAlgorithmName.SHA256, z, 4, t, "BHDS-v2 pair"u8.ToArray());
         CryptographicOperations.ZeroMemory(z);
         var code = BinaryPrimitives.ReadUInt32BigEndian(p) % 1_000_000;
         var d2l = k[..32]; var l2d = k[32..];

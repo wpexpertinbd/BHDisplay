@@ -23,6 +23,16 @@ internal sealed class TrayApp : ApplicationContext
     private readonly Dictionary<string, (Beacon B, DateTime Seen)> _unpaired = [];
     private readonly HashSet<string> _dialing = [];
     private DateTime _lastPrompt = DateTime.MinValue;
+    private DateTime _pairArmedUntil = DateTime.MinValue;   // new pairings accepted only after the user asks, for 2 min
+    private bool _promptOpen;                               // never stack pairing prompts
+
+    private void ArmPairing()
+    {
+        _pairArmedUntil = DateTime.UtcNow.AddMinutes(2);
+        Log.Write("ready to pair a new computer for 2 minutes");
+        _status = "Ready to pair — choose “Pair” on the Mac now (2 minutes)";
+        UpdateStatus(keepStatus: true);
+    }
     private bool _running, _controlling, _controlled;
     private uint _clipSeq;
     private bool _showsPc;                                 // the shared monitor currently shows this PC
@@ -43,13 +53,14 @@ internal sealed class TrayApp : ApplicationContext
         };
         _menu.Opening += (_, _) => BuildMenu();
         _icon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ToggleMonitor(); };
-        _hotkeys = new HotkeyWindow(OnHotkey);
+        _hotkeys = new HotkeyWindow(OnHotkey, OnSessionChange);
+        Current = this;
         _clipSeq = GetClipboardSequenceNumber();
 
         _capture.Edge = _emu.Edge = _settings.MacEdge;
         _capture.EdgeHit = pos => EdgeHit(pos);
         _capture.Captured = m => { if (_controlling) _session?.Send(m); };
-        _capture.LocalHotkey = h => OnLocalHotkey(h);
+        _capture.LocalHotkey = h => Post(() => OnLocalHotkey(h));   // never do slow work (DDC) inside the hook
         _emu.Left = pos => PeerPointerLeft(pos);
         _reconnect.Tick += (_, _) => ReconnectKnownPeers();
 
@@ -66,7 +77,8 @@ internal sealed class TrayApp : ApplicationContext
     private void Startup()
     {
         Log.Write("startup: message loop running");
-        if (FirstRun()) { SetStartWithWindows(true); _settings.Save(); Log.Write("first run: start with Windows on"); }
+        // Start with Windows only for the installed copy (a --portable copy in Downloads must never be auto-run).
+        if (FirstRun() && Installer.IsInstalledCopy) { SetStartWithWindows(true); _settings.Save(); Log.Write("first run: start with Windows on"); }
         if (_settings.Sharing) StartSharing();
         UpdateStatus();
         _icon.ShowBalloonTip(5000, "BHDisplay is running",
@@ -153,6 +165,36 @@ internal sealed class TrayApp : ApplicationContext
         Log.Write("← stopped controlling the Mac");
     }
 
+    public static TrayApp? Current { get; private set; }
+
+    /// Before a crash dialog: stop swallowing this PC's input and release keys pressed for the Mac,
+    /// or nothing could click the dialog's OK.
+    public static void EmergencyRelease()
+    {
+        var t = Current;
+        if (t is null) return;
+        try { t._capture.Dispose(); } catch { }
+        try { t._emu.ReleaseAll(); } catch { }
+    }
+
+    /// Locked, Ctrl+Alt+Del, UAC or switched user: the hooks stop seeing keys (key-ups go to the secure desktop),
+    /// so hand everything back on both sides. On unlock, re-install the hooks (Windows may have dropped them).
+    private void OnSessionChange(int code)
+    {
+        if (code is Native.WTS_SESSION_LOCK or Native.WTS_CONSOLE_DISCONNECT or Native.WTS_REMOTE_DISCONNECT)
+        {
+            Log.Write("session locked or disconnected: giving keyboard/mouse back on both sides");
+            if (_controlling) StopControlling();
+            if (_controlled) { _emu.Leave(); _controlled = false; _session?.Send(new ShareMsg.Leave(4, 0.5f)); }
+            UpdateStatus();
+        }
+        else if (code == Native.WTS_SESSION_UNLOCK && _running)
+        {
+            _capture.Restart();
+            Log.Write("session unlocked: input hooks re-installed");
+        }
+    }
+
     private void OnHotkey(int id)
     {
         switch (id)
@@ -236,6 +278,7 @@ internal sealed class TrayApp : ApplicationContext
         if (f.ShowDialog() != DialogResult.OK) return;
         if (!System.Net.IPAddress.TryParse(box.Text.Trim(), out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
         { MessageBox.Show("That isn't an IPv4 address.", "BHDisplay"); return; }
+        ArmPairing();
         _status = $"Connecting to {ip}…"; UpdateStatus(keepStatus: true);
         _ = Dial(ip.ToString(), Bhds.TcpPort, () => { });
     }
@@ -271,17 +314,19 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (!_running || _id is null) return;
         var key = P256.Hex(b.DeviceId);
+        if (_loggedBeacons.Count > 64) _loggedBeacons.Clear();     // bounded: beacons are unauthenticated
         if (_loggedBeacons.Add(key)) Log.Write($"discovered {b.Name} at {b.Host}:{b.Port} (paired: {IsPaired(b.FingerprintPrefix)})");
         if (IsPaired(b.FingerprintPrefix))
         {
             _unpaired.Remove(key);
             // Lower device id dials; the other side waits for it.
-            if (_session is null && _id.DeviceId.AsSpan().SequenceCompareTo(b.DeviceId) < 0 && _dialing.Add(key))
+            // Keyed by address, only our own port, a few at a time: a forged beacon can't make us dial around.
+            if (_session is null && _id.DeviceId.AsSpan().SequenceCompareTo(b.DeviceId) < 0 && _dialing.Count < 4 && _dialing.Add(b.Host))
             {
-                _ = Dial(b.Host, b.Port, () => _dialing.Remove(key));
+                _ = Dial(b.Host, Bhds.TcpPort, () => _dialing.Remove(b.Host));
             }
         }
-        else _unpaired[key] = (b, DateTime.UtcNow);
+        else if (_unpaired.ContainsKey(key) || _unpaired.Count < 16) _unpaired[key] = (b, DateTime.UtcNow);
         foreach (var k in _unpaired.Where(kv => DateTime.UtcNow - kv.Value.Seen > TimeSpan.FromSeconds(10)).Select(kv => kv.Key).ToList())
             _unpaired.Remove(k);
     }
@@ -293,9 +338,14 @@ internal sealed class TrayApp : ApplicationContext
         finally { _ = Task.Delay(15000).ContinueWith(_ => Post(done)); }
     }
 
+    private readonly HashSet<ShareSession> _handshaking = [];
+
     private void Adopt(ShareSession s)
     {
-        s.Ready += x => Post(() => OnReady(x));
+        // At most a few handshakes at a time: strangers can't pile up connections.
+        if (_handshaking.Count >= 8) { s.Close("too many connections"); return; }
+        _handshaking.Add(s);
+        s.Ready += x => Post(() => { _handshaking.Remove(x); OnReady(x); });
         s.Message += (x, m) => Post(() => OnMessage(x, m));
         s.Closed += (x, why) => Post(() => OnClosed(x, why));
         s.Start();
@@ -312,6 +362,10 @@ internal sealed class TrayApp : ApplicationContext
             {
                 // Both sides may dial at once: keep the connection dialed by the lower device id (both apply this rule).
                 if (!IsPreferred(s)) { s.Close("duplicate connection"); return; }
+                // The old session's close callback will find it is no longer current and do nothing,
+                // so release everything it carried now — never keep capturing for a session that is gone.
+                if (_controlling) { _capture.End(null); _controlling = false; }
+                if (_controlled) { _emu.Leave(); _controlled = false; }
                 old.Close("duplicate connection");
             }
             _session = s;
@@ -320,20 +374,27 @@ internal sealed class TrayApp : ApplicationContext
             UpdateStatus();
             return;
         }
-        // Unpaired: one pairing at a time, at most one prompt every 5 s.
-        if (_pairing is not null || DateTime.UtcNow - _lastPrompt < TimeSpan.FromSeconds(5)) { s.Close("busy pairing"); return; }
+        // Unpaired: only while the user asked for a pairing on this PC; one at a time, at most one prompt every 5 s.
+        if (DateTime.UtcNow >= _pairArmedUntil) { s.Close("not accepting new pairings"); return; }
+        if (_pairing is not null || _promptOpen || DateTime.UtcNow - _lastPrompt < TimeSpan.FromSeconds(5)) { s.Close("busy pairing"); return; }
         _lastPrompt = DateTime.UtcNow;
         _pairing = (s, false, false);
         _ = Task.Delay(60000).ContinueWith(_ => Post(() => { if (_pairing?.S == s) s.Close("pairing timed out"); }));
         var name = s.Peer?.Name ?? "another computer";
         var code = s.PairCode[..3] + " " + s.PairCode[3..];
-        var answer = MessageBox.Show(
-            $"{name} ({s.RemoteHost}) wants to share keyboard and mouse with this PC.\n\nPairing code:  {code}\n\n" +
-            "Pair only if the other computer shows exactly the same code. Once paired, its keyboard and mouse can control this PC.",
-            $"BHDisplay — pair with “{name}”?", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2, MessageBoxOptions.DefaultDesktopOnly);
+        var sameName = _settings.Paired.ContainsValue(name)
+            ? $"\n\n⚠ A computer named “{name}” is already paired — this is a DIFFERENT computer using that name." : "";
+        _promptOpen = true;
+        bool answer;
+        try
+        {
+            answer = PairDialog.Ask($"Pair with “{name}”?",
+                $"{name} ({s.RemoteHost}) wants to share keyboard and mouse with this PC.\n\nPairing code:  {code}\n\n" +
+                "Pair only if the other computer shows exactly the same code. Once paired, its keyboard and mouse can control this PC." + sameName);
+        }
+        finally { _promptOpen = false; }
         if (_pairing?.S != s) return;                      // timed out or closed while the dialog was open
-        if (answer == DialogResult.Yes)
+        if (answer)
         {
             _pairing = (s, true, _pairing.Value.Remote);
             s.Send(new ShareMsg.PairConfirm());
@@ -346,6 +407,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (_pairing is not { Local: true, Remote: true } p) return;
         _pairing = null;
+        _pairArmedUntil = DateTime.MinValue;
         _settings.Paired[P256.Hex(p.S.PeerFingerprint)] = p.S.Peer?.Name ?? "Mac";
         _settings.Save();
         OnReady(p.S);
@@ -353,6 +415,7 @@ internal sealed class TrayApp : ApplicationContext
 
     private void OnClosed(ShareSession s, string why)
     {
+        _handshaking.Remove(s);
         Log.Write($"session {s.RemoteHost} closed: {why}");
         if (_pairing?.S == s) _pairing = null;
         if (_session != s) return;
@@ -409,7 +472,7 @@ internal sealed class TrayApp : ApplicationContext
         if (!_running || _session is null || RecentHandover) return false;
         _lastHandover = Environment.TickCount64;
         if (_controlled) { _emu.Leave(); _controlled = false; }   // our own mouse wins: the Mac's pointer was here
-        SendClipboardIfChanged();
+        Post(SendClipboardIfChanged);                       // clipboard can block: not inside the hook
         Log.Write("→ controlling the Mac (pointer crossed the edge)");
         _session.Send(new ShareMsg.Enter((byte)(1 - _settings.MacEdge), pos));   // enters the Mac's facing edge
         _controlling = true;
@@ -436,6 +499,10 @@ internal sealed class TrayApp : ApplicationContext
         _clipSeq = seq;
         try
         {
+            // Password managers mark secrets with these formats (Microsoft's clipboard-history convention): never send them.
+            if (Clipboard.ContainsData("ExcludeClipboardContentFromMonitorProcessing") || Clipboard.ContainsData("CanIncludeInClipboardHistory")
+                && Clipboard.GetDataObject()?.GetData("CanIncludeInClipboardHistory") is System.IO.MemoryStream { Length: >= 4 } ms && BitConverter.ToInt32(ms.ToArray(), 0) == 0)
+                return;
             if (Clipboard.ContainsText() && Clipboard.GetText() is { Length: > 0 } t && System.Text.Encoding.UTF8.GetByteCount(t) <= Bhds.MaxClipboard)
                 _session?.Send(new ShareMsg.Clipboard(t));
         }
@@ -444,7 +511,11 @@ internal sealed class TrayApp : ApplicationContext
 
     private void ApplyClipboard(string text)
     {
-        try { if (Clipboard.ContainsText() && Clipboard.GetText() == text) { _clipSeq = GetClipboardSequenceNumber(); return; } Clipboard.SetText(text); }
+        try
+        {
+            if (Clipboard.ContainsText() && Clipboard.GetText() == text) { _clipSeq = GetClipboardSequenceNumber(); return; }
+            Clipboard.SetText(text);           // secrets never arrive: the Mac skips concealed (password) items
+        }
         catch (ExternalException) { return; }
         _clipSeq = GetClipboardSequenceNumber();
     }
@@ -494,8 +565,9 @@ internal sealed class TrayApp : ApplicationContext
             _menu.Items.Add(new ToolStripMenuItem("    This PC: " + LocalAddresses()) { Enabled = false });
             if (_session is null)
                 _menu.Items.Add(new ToolStripMenuItem("    Connect to the Mac by IP address…", null, (_, _) => AskForAddress()));
+            _menu.Items.Add(new ToolStripMenuItem("    Pair a new computer…", null, (_, _) => ArmPairing()));
             foreach (var (_, (b, _)) in _unpaired)
-                _menu.Items.Add(new ToolStripMenuItem($"    Pair with {b.Name}…", null, (_, _) => _ = Dial(b.Host, b.Port, () => { })));
+                _menu.Items.Add(new ToolStripMenuItem($"    Pair with {b.Name}…", null, (_, _) => { ArmPairing(); _ = Dial(b.Host, Bhds.TcpPort, () => { }); }));
             foreach (var (fp, name) in _settings.Paired.ToList())
                 _menu.Items.Add(new ToolStripMenuItem($"    Forget {name}", null, (_, _) =>
                 {
@@ -537,11 +609,12 @@ internal sealed class TrayApp : ApplicationContext
 /// Hidden window that receives the global Ctrl+Alt+Win shortcuts.
 internal sealed class HotkeyWindow : NativeWindow, IDisposable
 {
-    private readonly Action<int> _onHotkey;
-    public HotkeyWindow(Action<int> onHotkey)
+    private readonly Action<int> _onHotkey, _onSession;
+    public HotkeyWindow(Action<int> onHotkey, Action<int> onSession)
     {
-        _onHotkey = onHotkey;
+        _onHotkey = onHotkey; _onSession = onSession;
         CreateHandle(new CreateParams());
+        Native.WTSRegisterSessionNotification(Handle, 0);   // NOTIFY_FOR_THIS_SESSION
         const uint mods = Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_WIN | Native.MOD_NOREPEAT;
         Native.RegisterHotKey(Handle, 1, mods, 'S');
         Native.RegisterHotKey(Handle, 2, mods, '1');
@@ -551,7 +624,32 @@ internal sealed class HotkeyWindow : NativeWindow, IDisposable
     protected override void WndProc(ref Message m)
     {
         if (m.Msg == Native.WM_HOTKEY) _onHotkey((int)m.WParam);
+        else if (m.Msg == Native.WM_WTSSESSION_CHANGE) _onSession((int)m.WParam);
         base.WndProc(ref m);
     }
-    public void Dispose() { for (int i = 1; i <= 4; i++) Native.UnregisterHotKey(Handle, i); DestroyHandle(); }
+    public void Dispose() { for (int i = 1; i <= 4; i++) Native.UnregisterHotKey(Handle, i); Native.WTSUnRegisterSessionNotification(Handle); DestroyHandle(); }
+}
+
+/// Pairing confirmation: no key answers "Pair" (a stray Enter or "y" must never pair) and the button can't be
+/// clicked for the first 1.5 s. Esc = Don't Pair.
+internal static class PairDialog
+{
+    public static bool Ask(string title, string text)
+    {
+        using var f = new Form { Text = "BHDisplay — " + title, Width = 460, Height = 270, FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false, TopMost = true, ShowInTaskbar = true };
+        var label = new Label { Text = text, Left = 14, Top = 12, Width = 420, Height = 170, UseMnemonic = false };
+        var pair = new Button { Text = "Pair", Left = 250, Top = 190, Width = 85, Enabled = false, UseMnemonic = false };
+        var no = new Button { Text = "Don't Pair", Left = 345, Top = 190, Width = 90, DialogResult = DialogResult.Cancel, UseMnemonic = false };
+        pair.Click += (_, _) => { f.DialogResult = DialogResult.OK; f.Close(); };
+        f.Controls.AddRange([label, pair, no]);
+        f.CancelButton = no;
+        f.Shown += (_, _) => { no.Focus(); };
+        var t = new System.Windows.Forms.Timer { Interval = 1500 };
+        t.Tick += (_, _) => { t.Stop(); pair.Enabled = true; };
+        t.Start();
+        var r = f.ShowDialog();
+        t.Dispose();
+        return r == DialogResult.OK;
+    }
 }

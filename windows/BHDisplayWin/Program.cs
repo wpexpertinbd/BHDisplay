@@ -1,5 +1,10 @@
 // BHDisplay for Windows — entry point. One instance per user session.
 // A tray app has no window, so every failure must be shown and logged — never exit silently.
+using System.Runtime.InteropServices;
+
+// Load Windows DLLs (dxva2, crypt32, user32…) only from System32 — never from the folder the exe sits in.
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+
 namespace BHDisplay.Win;
 
 internal static class Program
@@ -35,6 +40,7 @@ internal static class Program
     private static void Fatal(Exception? e)
     {
         Log.Write("FATAL " + e);
+        try { TrayApp.EmergencyRelease(); } catch { }
         MessageBox.Show($"BHDisplay hit an error and has to close:\n\n{e?.Message}\n\nDetails were saved to:\n{Log.FilePath}",
             "BHDisplay", MessageBoxButtons.OK, MessageBoxIcon.Error);
         Environment.Exit(1);
