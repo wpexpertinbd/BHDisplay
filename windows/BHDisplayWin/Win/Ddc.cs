@@ -42,7 +42,7 @@ internal static class Ddc
     }
 
     public static uint? CurrentInput() =>
-        WithMonitor<uint?>((h, _) => GetVCPFeatureAndVCPFeatureReply(h, VcpInput, out _, out var cur, out _) ? cur & 0xFF : null);
+        WithMonitor<uint?>((h, _desc) => GetVCPFeatureAndVCPFeatureReply(h, VcpInput, out _, out var cur, out _) ? cur & 0xFF : null);
 
     public static string? MonitorName() => WithMonitor<string>((_, d) => d);
 
@@ -50,7 +50,7 @@ internal static class Ddc
     public static bool Switch(byte code)
     {
         if (!IsInput(code)) return false;
-        return WithMonitor<bool?>((h, _) =>
+        return WithMonitor<bool?>((h, _desc) =>
         {
             if (GetVCPFeatureAndVCPFeatureReply(h, VcpInput, out _, out var cur, out _) && (cur & 0xFF) == code) return true;
             return SetVCPFeature(h, VcpInput, code);

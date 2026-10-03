@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
+using Timer = System.Threading.Timer;
 
 namespace BHDisplay.Core;
 

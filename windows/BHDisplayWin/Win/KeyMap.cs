@@ -42,7 +42,7 @@ internal static class KeyMap
     {
         if (vk == VkNumLock) return HidNumLock;
         if (vk == VkPause) return HidPause;
-        var key = (ushort)((extended ? 0xE000 : 0) | (scan & 0xFF));
+        var key = (ushort)((extended ? 0xE000u : 0u) | (scan & 0xFFu));
         return ToHidMap.TryGetValue(key, out var h) ? h : null;
     }
 }

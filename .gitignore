@@ -6,3 +6,8 @@ dist/
 Icon/AppIcon.iconset/
 .claude/
 CLAUDE.md
+windows/dist/
+windows/BHDisplayWin/bin/
+windows/BHDisplayWin/obj/
+tests/interop/csharp/bin/
+tests/interop/csharp/obj/

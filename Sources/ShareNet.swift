@@ -23,6 +23,9 @@ final class ShareSession: @unchecked Sendable {
     private var recvCipher: RecordCipher?
     private var lastReceive = Date()
     private var timer: DispatchSourceTimer?
+    /// An open session keeps itself alive until it closes (like the connection it wraps), so it cannot
+    /// vanish just because the caller didn't store it — its own callbacks only hold it weakly.
+    private var keepAlive: ShareSession?
 
     private(set) var peer: Hello?
     private(set) var pairCode = ""
@@ -55,6 +58,7 @@ final class ShareSession: @unchecked Sendable {
     }
 
     func start() {
+        keepAlive = self
         conn.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
             switch st {
@@ -94,6 +98,7 @@ final class ShareSession: @unchecked Sendable {
         conn.cancel()
         onClose?(self, reason)
         onClose = nil; onMessage = nil; onReady = nil
+        keepAlive = nil
     }
 
     // MARK: private
@@ -182,18 +187,18 @@ final class ShareListener: @unchecked Sendable {
     var onSession: ((ShareSession) -> Void)?
     var onError: ((String) -> Void)?
 
-    func start(identity: ShareIdentity, queue: DispatchQueue) {
+    func start(identity: ShareIdentity, queue: DispatchQueue, port: UInt16 = BHDS.tcpPort) {
         do {
-            let l = try NWListener(using: ShareSession.tcpParameters(), on: NWEndpoint.Port(rawValue: BHDS.tcpPort)!)
+            let l = try NWListener(using: ShareSession.tcpParameters(), on: NWEndpoint.Port(rawValue: port)!)
             l.newConnectionHandler = { [weak self] c in
                 self?.onSession?(ShareSession(connection: c, role: .listener, identity: identity, queue: queue))
             }
             l.stateUpdateHandler = { [weak self] st in
-                if case .failed(let e) = st { self?.onError?("can't listen on port \(BHDS.tcpPort): \(e)") }
+                if case .failed(let e) = st { self?.onError?("can't listen on port \(port): \(e)") }
             }
             l.start(queue: queue)
             listener = l
-        } catch { onError?("can't listen on port \(BHDS.tcpPort): \(error)") }
+        } catch { onError?("can't listen on port \(port): \(error)") }
     }
 
     func stop() { listener?.cancel(); listener = nil }
