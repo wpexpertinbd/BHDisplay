@@ -216,35 +216,68 @@ struct ContentView: View {
         }
     }
 
-    @ObservedObject private var sharing = SharingModel.shared
+    @ObservedObject private var share = ShareController.shared
+    @ObservedObject private var lanMouse = SharingModel.shared      // fallback only
 
     private var sharingCard: some View {
         Card(title: "Keyboard & Mouse", icon: "keyboard", trailing: {
-            if sharing.state != .notInstalled {
-                Toggle("", isOn: Binding(get: { sharing.isOn }, set: { sharing.set($0) }))
-                    .toggleStyle(.switch).labelsHidden().tint(accent)
-                    .disabled(sharing.busy)
-            }
+            Toggle("", isOn: Binding(get: { share.enabled }, set: { on in
+                if on, lanMouse.isOn { lanMouse.set(false) }
+                share.enabled = on
+            }))
+            .toggleStyle(.switch).labelsHidden().tint(accent)
         }) {
             VStack(alignment: .leading, spacing: 8) {
-                Text(sharing.statusText).font(.system(size: 12)).foregroundStyle(.secondary)
+                Text(share.status).font(.system(size: 12)).foregroundStyle(.secondary)
                     .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
-                if let e = sharing.error {
-                    Text(e).font(.system(size: 11)).foregroundStyle(.orange)
+                if share.needsAccessibility {
+                    HStack {
+                        Button("Open Accessibility Settings…") {
+                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                        }
+                        Button("Check Again") { share.retryAccessibility() }
+                    }
+                    .controlSize(.small)
+                }
+                if share.enabled && share.running {
+                    ForEach(share.discovered) { d in
+                        HStack {
+                            Image(systemName: "desktopcomputer")
+                            Text("\(d.name)  ·  \(d.host)").font(.system(size: 12))
+                            Spacer()
+                            Button("Pair…") { share.pair(with: d) }.controlSize(.small)
+                        }
+                    }
+                    ForEach(share.paired.sorted(by: { $0.value < $1.value }), id: \.key) { fp, name in
+                        HStack {
+                            Image(systemName: "checkmark.seal.fill").foregroundStyle(accent)
+                            Text(name).font(.system(size: 12))
+                            Spacer()
+                            Button("Forget") { share.forget(fp) }.controlSize(.small)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        Text("Other computer is on the").font(.system(size: 12))
+                        Picker("", selection: Binding(get: { share.side }, set: { share.side = $0 })) {
+                            Text("Left").tag(ShareEdge.left)
+                            Text("Right").tag(ShareEdge.right)
+                        }
+                        .pickerStyle(.segmented).labelsHidden().frame(width: 120)
+                    }
+                    Toggle("⌘ on the Mac = Ctrl on Windows", isOn: Binding(get: { share.swapCmdCtrl }, set: { share.swapCmdCtrl = $0 }))
+                        .font(.system(size: 12)).toggleStyle(.checkbox)
                 }
                 HStack {
-                    if sharing.state == .notInstalled {
-                        Button("Get Lan Mouse (free)…") { NSWorkspace.shared.open(InputSharing.releasesURL) }
-                    } else {
-                        Button("Lan Mouse Settings…") { InputSharing.openSettings() }
-                    }
-                    Spacer()
                     Text("Moving the mouse never changes the monitor.").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Spacer()
+                    if !share.enabled && lanMouse.state != .notInstalled {
+                        Toggle("Lan Mouse (fallback)", isOn: Binding(get: { lanMouse.isOn }, set: { lanMouse.set($0) }))
+                            .toggleStyle(.checkbox).font(.system(size: 10)).disabled(lanMouse.busy)
+                    }
                 }
-                .controlSize(.small)
             }
         }
-        .onAppear { sharing.refresh() }
+        .onAppear { lanMouse.refresh() }
     }
 
     private var colorCard: some View {

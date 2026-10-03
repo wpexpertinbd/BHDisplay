@@ -31,10 +31,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHumanReadableCopyright</key><string>© 2026 BiswasHost</string>
+  <key>NSLocalNetworkUsageDescription</key><string>BHDisplay finds and connects to BHDisplay on your other computer to share your keyboard and mouse.</string>
 </dict></plist>
 PLIST
-# Ad-hoc signature with the hardened runtime (no Developer ID on this machine).
-codesign --force --options runtime --timestamp=none --sign - "$APP"
+# Signed with the stable self-signed "BHTerminal Dev" identity (hardened runtime, no Developer ID): macOS then
+# recognises every update as the same app, so the Accessibility permission (keyboard & mouse sharing) survives
+# updates. Ad-hoc signing ties that permission to one exact build. Override with SIGN_ID=- for ad-hoc.
+SIGN_ID="${SIGN_ID:-BHTerminal Dev}"
+codesign --force --options runtime --timestamp=none --sign "$SIGN_ID" "$APP"
 codesign --verify --strict "$APP"
 # Keep the dev copy out of Spotlight / "Open With": only /Applications/BHDisplay.app should be registered.
 touch build/.metadata_never_index

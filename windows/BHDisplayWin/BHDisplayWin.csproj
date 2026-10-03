@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- BHDisplay for Windows: tray app (WinForms). Builds on macOS too:
+       dotnet publish -c Release -r win-x64  → single self-contained BHDisplay.exe -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>BHDisplay</AssemblyName>
+    <RootNamespace>BHDisplay.Win</RootNamespace>
+    <ApplicationIcon>BHDisplay.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Product>BHDisplay</Product>
+    <Company>BiswasHost</Company>
+    <Copyright>© 2026 BiswasHost</Copyright>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+</Project>

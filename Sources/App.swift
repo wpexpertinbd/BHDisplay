@@ -194,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         registerHotKeys()
         SharingModel.shared.refresh()
         InputSharing.trimLog()
+        ShareController.shared.bootstrap()
         m.refresh()
         // Re-read when the monitor is plugged/unplugged or wakes.
         CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
@@ -269,19 +270,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(ab)
         let o = NSMenuItem(title: "Open BHDisplay…", action: #selector(showWindow), keyEquivalent: ","); o.target = self
         menu.addItem(o)
-        // Keyboard & mouse sharing (Lan Mouse) — never changes the monitor input.
-        let sh = SharingModel.shared
-        if sh.state == .notInstalled {
-            let g = NSMenuItem(title: "Keyboard & Mouse Sharing — Get Lan Mouse…", action: #selector(getLanMouse), keyEquivalent: ""); g.target = self
-            menu.addItem(g)
-        } else {
-            let k = NSMenuItem(title: "Keyboard & Mouse Sharing", action: #selector(toggleSharing), keyEquivalent: ""); k.target = self
-            k.state = sh.state == .starting ? .mixed : (sh.isOn ? .on : .off)
-            k.isEnabled = !sh.busy
-            menu.addItem(k)
-            let st = NSMenuItem(title: "Lan Mouse Settings…", action: #selector(lanMouseSettings), keyEquivalent: ""); st.target = self
+        // Keyboard & mouse sharing — never changes the monitor input.
+        let share = ShareController.shared
+        let k = NSMenuItem(title: "Keyboard & Mouse Sharing", action: #selector(toggleSharing), keyEquivalent: ""); k.target = self
+        k.state = share.enabled ? .on : .off
+        menu.addItem(k)
+        if share.enabled {
+            let st = NSMenuItem(title: "    " + share.status, action: nil, keyEquivalent: ""); st.isEnabled = false
             menu.addItem(st)
+            for d in share.discovered {
+                let p = NSMenuItem(title: "    Pair with \(d.name)…", action: #selector(pairDevice(_:)), keyEquivalent: ""); p.target = self
+                p.representedObject = d.id
+                menu.addItem(p)
+            }
         }
+        let sh = SharingModel.shared
         sh.refresh()
         menu.addItem(.separator())
         let l = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: ""); l.target = self
@@ -297,7 +300,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     @objc private func toggle() { m.toggleMacOther() }
-    @objc private func toggleSharing() { SharingModel.shared.set(!SharingModel.shared.isOn) }
+    @objc private func toggleSharing() {
+        let share = ShareController.shared
+        if !share.enabled, SharingModel.shared.isOn { SharingModel.shared.set(false) }
+        share.enabled.toggle()
+        if share.enabled && share.needsAccessibility { showWindow() }
+    }
+    @objc private func pairDevice(_ item: NSMenuItem) {
+        let share = ShareController.shared
+        if let id = item.representedObject as? String, let d = share.discovered.first(where: { $0.id == id }) { share.pair(with: d) }
+    }
     @objc private func lanMouseSettings() { InputSharing.openSettings() }
     @objc private func getLanMouse() { NSWorkspace.shared.open(InputSharing.releasesURL) }
 

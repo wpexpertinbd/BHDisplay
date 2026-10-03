@@ -1,0 +1,239 @@
+// Keyboard & mouse sharing — TCP session (handshake + encrypted frames), listener, and UDP discovery.
+// Events are raised on thread-pool threads; the app marshals them to its UI thread.
+using System.Buffers.Binary;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace BHDisplay.Core;
+
+public enum Role { Dialer, Listener }
+
+public sealed class ShareSession
+{
+    public Role Role { get; }
+    public Hello? Peer { get; private set; }
+    public string PairCode { get; private set; } = "";
+    public string RemoteHost { get; }
+    public byte[] PeerFingerprint => Peer is null ? [] : SHA256.HashData(Peer.IdentityKey);
+
+    public event Action<ShareSession>? Ready;
+    public event Action<ShareSession, ShareMsg>? Message;
+    public event Action<ShareSession, string>? Closed;
+
+    private readonly TcpClient _client;
+    private readonly NetworkStream _stream;
+    private readonly ShareIdentity _identity;
+    private readonly ECDiffieHellman _ephemeral = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly CancellationTokenSource _cts = new();
+    private byte[] _myHello = [];
+    private byte[] _transcript = [];
+    private RecordCipher? _send, _recv;
+    private bool _open;
+    private int _closed;
+    private long _lastReceive = Environment.TickCount64;
+    private Timer? _timer;
+
+    private ShareSession(TcpClient client, Role role, ShareIdentity identity)
+    {
+        _client = client; Role = role; _identity = identity;
+        _client.NoDelay = true;
+        _stream = client.GetStream();
+        RemoteHost = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "?";
+    }
+
+    public static ShareSession Accept(TcpClient c, ShareIdentity id) => new(c, Role.Listener, id);
+
+    public static async Task<ShareSession> DialAsync(string host, int port, ShareIdentity id)
+    {
+        var c = new TcpClient { NoDelay = true };
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await c.ConnectAsync(host, port, cts.Token);
+        return new ShareSession(c, Role.Dialer, id);
+    }
+
+    public void Start()
+    {
+        _timer = new Timer(_ => Tick(), null, 2000, 2000);
+        _ = Task.Run(RunAsync);
+    }
+
+    public void Send(ShareMsg m) => _ = SendAsync(m);
+
+    public async Task SendAsync(ShareMsg m)
+    {
+        if (!_open || _closed != 0) return;
+        await _writeLock.WaitAsync();
+        try
+        {
+            if (_send is null || _closed != 0) return;
+            await WriteFrameAsync(_send.Seal(m.Encode()));     // seal under the lock: sequence order = write order
+        }
+        catch (Exception e) { Close($"send failed: {e.Message}"); }
+        finally { _writeLock.Release(); }
+    }
+
+    public void Close(string reason)
+    {
+        if (Interlocked.Exchange(ref _closed, 1) != 0) return;
+        _timer?.Dispose();
+        _cts.Cancel();
+        try { _client.Close(); } catch { }
+        _ephemeral.Dispose(); _send?.Dispose(); _recv?.Dispose();
+        Closed?.Invoke(this, reason);
+    }
+
+    private void Tick()
+    {
+        var idle = Environment.TickCount64 - Interlocked.Read(ref _lastReceive);
+        if (_open) { if (idle > 6000) Close("peer stopped responding"); else Send(new ShareMsg.Ping()); }
+        else if (idle > 10000) Close("handshake timed out");
+    }
+
+    private async Task WriteFrameAsync(byte[] body)
+    {
+        var buf = new byte[4 + body.Length];
+        BinaryPrimitives.WriteUInt32BigEndian(buf, (uint)body.Length);
+        body.CopyTo(buf, 4);
+        await _stream.WriteAsync(buf, _cts.Token);
+    }
+
+    private async Task<byte[]> ReadFrameAsync()
+    {
+        var head = new byte[4];
+        await _stream.ReadExactlyAsync(head, _cts.Token);
+        var n = BinaryPrimitives.ReadUInt32BigEndian(head);
+        if (n < 1 || n > Bhds.MaxFrame) throw new WireException("bad frame length");
+        var body = new byte[n];
+        await _stream.ReadExactlyAsync(body, _cts.Token);
+        Interlocked.Exchange(ref _lastReceive, Environment.TickCount64);
+        return body;
+    }
+
+    private byte[] MakeHello() => new Hello(_identity.DeviceId, _identity.PublicKey,
+        P256.Export(_ephemeral.ExportParameters(false)), RandomNumberGenerator.GetBytes(32), _identity.Name).Encode();
+
+    private async Task RunAsync()
+    {
+        try
+        {
+            if (Role == Role.Dialer) { _myHello = MakeHello(); await WriteFrameAsync(_myHello); }
+
+            var peerHello = await ReadFrameAsync();
+            var h = Hello.Decode(peerHello);
+            if (h.DeviceId.AsSpan().SequenceEqual(_identity.DeviceId)) throw new WireException("connected to itself");
+            Peer = h;
+            if (Role == Role.Listener) { _myHello = MakeHello(); await WriteFrameAsync(_myHello); }
+            _transcript = Role == Role.Dialer ? Handshake.Transcript(_myHello, peerHello) : Handshake.Transcript(peerHello, _myHello);
+            await WriteFrameAsync(Handshake.Sign(_identity, Role == Role.Dialer ? (byte)0 : (byte)1, _transcript));
+
+            var sig = await ReadFrameAsync();
+            if (!Handshake.Verify(sig, h.IdentityKey, Role == Role.Dialer ? (byte)1 : (byte)0, _transcript))
+                throw new WireException("peer failed authentication");
+            var keys = Handshake.DeriveKeys(_ephemeral, h.EphemeralKey, _transcript, Role == Role.Dialer);
+            _send = new RecordCipher(keys.Send); _recv = new RecordCipher(keys.Receive);
+            PairCode = keys.PairCode;
+            _open = true;
+            Ready?.Invoke(this);
+
+            while (_closed == 0)
+            {
+                var msg = ShareMsg.Decode(_recv.Open(await ReadFrameAsync()));
+                if (msg is ShareMsg.Ping) Send(new ShareMsg.Pong());
+                Message?.Invoke(this, msg);
+            }
+        }
+        catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException) { Close("connection closed"); }
+        catch (EndOfStreamException) { Close("peer closed"); }
+        catch (AuthenticationTagMismatchException) { Close("decryption failed"); }
+        catch (Exception e) { Close(e.Message); }
+    }
+}
+
+public sealed class ShareListener
+{
+    private TcpListener? _l;
+    public event Action<ShareSession>? Session;
+    public event Action<string>? Error;
+
+    public void Start(ShareIdentity id, int port = Bhds.TcpPort)
+    {
+        try
+        {
+            _l = new TcpListener(IPAddress.Any, port);
+            _l.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            _l.Start();
+        }
+        catch (Exception e) { Error?.Invoke($"can't listen on port {port}: {e.Message}"); return; }
+        _ = Task.Run(async () =>
+        {
+            while (_l is not null)
+            {
+                try { var c = await _l.AcceptTcpClientAsync(); Session?.Invoke(ShareSession.Accept(c, id)); }
+                catch (Exception) when (_l is null) { return; }
+                catch (Exception) { await Task.Delay(500); }
+            }
+        });
+    }
+
+    public void Stop() { var l = _l; _l = null; l?.Stop(); }
+}
+
+public sealed record Beacon(byte[] DeviceId, string Host, int Port, byte[] FingerprintPrefix, string Name);
+
+/// UDP broadcast "here I am" beacons. Informational only — sessions authenticate everything.
+public sealed class ShareDiscovery
+{
+    private UdpClient? _udp;
+    private Timer? _timer;
+    public event Action<Beacon>? Found;
+
+    public void Start(ShareIdentity id, int tcpPort = Bhds.TcpPort)
+    {
+        var u = new UdpClient { EnableBroadcast = true };
+        u.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        u.Client.Bind(new IPEndPoint(IPAddress.Any, Bhds.UdpPort));
+        _udp = u;
+        var w = new WireWriter();
+        w.Bytes(Bhds.BeaconMagic); w.Bytes(id.DeviceId); w.U16((ushort)tcpPort); w.Bytes(id.Fingerprint.AsSpan(0, 8));
+        var n = Encoding.UTF8.GetBytes(id.Name); if (n.Length > 64) n = n[..64];
+        w.U8((byte)n.Length); w.Bytes(n);
+        var beacon = w.ToArray();
+        _timer = new Timer(_ =>
+        {
+            try { _udp?.Send(beacon, beacon.Length, new IPEndPoint(IPAddress.Broadcast, Bhds.UdpPort)); } catch { }
+        }, null, 0, 2000);
+        _ = Task.Run(async () =>
+        {
+            while (_udp is { } c)
+            {
+                try
+                {
+                    var r = await c.ReceiveAsync();
+                    if (TryParse(r.Buffer, r.RemoteEndPoint.Address.ToString(), id.DeviceId) is { } b) Found?.Invoke(b);
+                }
+                catch (Exception) when (_udp is null) { return; }
+                catch (Exception) { await Task.Delay(200); }
+            }
+        });
+    }
+
+    public static Beacon? TryParse(byte[] buf, string host, byte[] ownId)
+    {
+        try
+        {
+            var r = new WireReader(buf);
+            if (!r.Bytes(5).SequenceEqual(Bhds.BeaconMagic)) return null;
+            var id = r.Bytes(16).ToArray();
+            if (id.AsSpan().SequenceEqual(ownId)) return null;
+            var port = r.U16(); var fp = r.Bytes(8).ToArray();
+            int nl = r.U8(); if (nl > 64) return null;
+            return new Beacon(id, host, port, fp, Encoding.UTF8.GetString(r.Bytes(nl)));
+        }
+        catch (WireException) { return null; }
+    }
+
+    public void Stop() { _timer?.Dispose(); var u = _udp; _udp = null; u?.Close(); }
+}
