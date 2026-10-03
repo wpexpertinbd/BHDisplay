@@ -292,6 +292,23 @@ enum ShareCursor {
 /// Replays the peer's input on this Mac. Every posted event is tagged so our capture ignores it.
 final class ShareEmulator {
     var swapCmdCtrl = true
+    /// User multiplier on top of the acceleration curve (0.5…3).
+    var speed: Double = 1
+    /// User multiplier for the peer's scroll wheel (0.5…5).
+    var scrollSpeed: Double = 1
+    private var scrollRemainder = (x: 0.0, y: 0.0)
+    private var remainder = (x: 0.0, y: 0.0)
+
+    /// The peer sends plain pixel deltas; macOS's own mice get acceleration, so without it the peer's mouse
+    /// feels slow here. Small, precise moves stay ~1:1, fast flicks go further.
+    private func accelerated(_ dx: Int16, _ dy: Int16) -> CGPoint {
+        let mag = hypot(Double(dx), Double(dy))
+        let gain = speed * (1 + 0.09 * min(mag, 25))
+        let x = Double(dx) * gain + remainder.x, y = Double(dy) * gain + remainder.y
+        let ix = x.rounded(.towardZero), iy = y.rounded(.towardZero)
+        remainder = (x - ix, y - iy)
+        return CGPoint(x: ix, y: iy)
+    }
     /// The controlled pointer moved onto the shared monitor (which shows the peer) — return control there.
     var onLeave: ((Float) -> Void)?
 
@@ -326,7 +343,8 @@ final class ShareEmulator {
 
     func move(dx: Int16, dy: Int16) {
         guard active else { return }
-        let target = CGPoint(x: cursor.x + CGFloat(dx), y: cursor.y + CGFloat(dy))
+        let d = accelerated(dx, dy)
+        let target = CGPoint(x: cursor.x + d.x, y: cursor.y + d.y)
         if let l = leaveLayout, l.crossing(target, dx: CGFloat(dx)) {
             let pos = l.position(target)
             leave()
@@ -338,8 +356,8 @@ final class ShareEmulator {
             : pressedButtons.contains(2) ? .rightMouseDragged
             : pressedButtons.isEmpty ? .mouseMoved : .otherMouseDragged
         let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: .left)
-        e?.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx))
-        e?.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy))
+        e?.setIntegerValueField(.mouseEventDeltaX, value: Int64(d.x))
+        e?.setIntegerValueField(.mouseEventDeltaY, value: Int64(d.y))
         post(e)
     }
 
@@ -368,11 +386,18 @@ final class ShareEmulator {
 
     func scroll(dx: Int16, dy: Int16) {
         guard active else { return }
-        // Whole notches → line events (like a wheel); anything finer → pixel events (like a trackpad).
+        // Whole notches → line events (like a wheel): 3 lines per notch, as on Windows, times the user's scroll
+        // speed. Anything finer → pixel events (like a trackpad), scaled the same way.
         if dy % 120 == 0 && dx % 120 == 0 {
-            post(CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 2, wheel1: Int32(dy / 120), wheel2: Int32(dx / 120), wheel3: 0))
+            let y = Double(dy) / 120 * 3 * scrollSpeed + scrollRemainder.y, x = Double(dx) / 120 * 3 * scrollSpeed + scrollRemainder.x
+            let iy = y.rounded(.towardZero), ix = x.rounded(.towardZero)
+            scrollRemainder = (x - ix, y - iy)
+            if iy != 0 || ix != 0 {
+                post(CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 2, wheel1: Int32(iy), wheel2: Int32(ix), wheel3: 0))
+            }
         } else {
-            post(CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: Int32(dy) / 3, wheel2: Int32(dx) / 3, wheel3: 0))
+            post(CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                         wheel1: Int32(Double(dy) / 3 * scrollSpeed), wheel2: Int32(Double(dx) / 3 * scrollSpeed), wheel3: 0))
         }
     }
 

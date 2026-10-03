@@ -266,6 +266,18 @@ struct ContentView: View {
                     }
                     Toggle("⌘ on the Mac = Ctrl on Windows", isOn: Binding(get: { share.swapCmdCtrl }, set: { share.swapCmdCtrl = $0 }))
                         .font(.system(size: 12)).toggleStyle(.checkbox)
+                    HStack {
+                        Text("Other computer's mouse speed here").font(.system(size: 12))
+                        Slider(value: Binding(get: { share.peerMouseSpeed }, set: { share.peerMouseSpeed = $0 }), in: 0.5...3)
+                            .controlSize(.small).frame(maxWidth: 160)
+                        Text(String(format: "%.1f×", share.peerMouseSpeed)).font(.system(size: 11).monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("Other computer's scroll speed here").font(.system(size: 12))
+                        Slider(value: Binding(get: { share.peerScrollSpeed }, set: { share.peerScrollSpeed = $0 }), in: 0.5...5)
+                            .controlSize(.small).frame(maxWidth: 160)
+                        Text(String(format: "%.1f×", share.peerScrollSpeed)).font(.system(size: 11).monospacedDigit()).foregroundStyle(.secondary)
+                    }
                 }
                 HStack {
                     Text("Moving the mouse never changes the monitor.").font(.system(size: 10)).foregroundStyle(.secondary)

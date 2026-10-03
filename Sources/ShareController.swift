@@ -23,6 +23,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     @Published private(set) var controlling = false                // this Mac's input goes to the peer
     @Published private(set) var controlled = false                 // the peer's input drives this Mac
     @Published var enabled: Bool { didSet { UserDefaults.standard.set(enabled, forKey: "shareEnabled"); enabled ? start() : stop() } }
+    /// Speed of the other computer's mouse on this Mac (1 = default curve).
+    @Published var peerMouseSpeed: Double { didSet { UserDefaults.standard.set(peerMouseSpeed, forKey: "sharePeerMouseSpeed"); emulator.speed = peerMouseSpeed } }
+    @Published var peerScrollSpeed: Double { didSet { UserDefaults.standard.set(peerScrollSpeed, forKey: "sharePeerScrollSpeed"); emulator.scrollSpeed = peerScrollSpeed } }
     @Published var swapCmdCtrl: Bool { didSet { UserDefaults.standard.set(swapCmdCtrl, forKey: "shareSwapCmdCtrl"); capture.swapCmdCtrl = swapCmdCtrl; emulator.swapCmdCtrl = swapCmdCtrl } }
     @Published private(set) var paired: [String: String]
 
@@ -50,10 +53,12 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         let d = UserDefaults.standard
         enabled = d.bool(forKey: "shareEnabled")
         swapCmdCtrl = d.object(forKey: "shareSwapCmdCtrl") as? Bool ?? true
+        peerMouseSpeed = min(max(d.object(forKey: "sharePeerMouseSpeed") as? Double ?? 1, 0.5), 3)
+        peerScrollSpeed = min(max(d.object(forKey: "sharePeerScrollSpeed") as? Double ?? 1, 0.5), 5)
         paired = d.dictionary(forKey: "sharePaired") as? [String: String] ?? [:]
         super.init()
         capture.delegate = self
-        capture.swapCmdCtrl = swapCmdCtrl; emulator.swapCmdCtrl = swapCmdCtrl
+        capture.swapCmdCtrl = swapCmdCtrl; emulator.swapCmdCtrl = swapCmdCtrl; emulator.speed = peerMouseSpeed; emulator.scrollSpeed = peerScrollSpeed
         emulator.onLeave = { [weak self] pos in MainActor.assumeIsolated { self?.peerPointerLeft(position: pos) } }
     }
 
