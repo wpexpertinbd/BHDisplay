@@ -264,10 +264,25 @@ final class MonitorModel: ObservableObject {
     }
 
     /// One-key flip between this Mac and the other computer.
+    /// Reads the monitor's real input first: a script, the command line or the monitor's buttons may have
+    /// switched it since our last read, and a stale value would flip the wrong way.
+    /// Presses that arrive while the read is in flight are counted, not lost: an even number of presses
+    /// lands back where you started, an odd number flips once.
+    private var togglePresses = 0
+
     func toggleMacOther() {
         guard let mac = macInput else { refresh(full: false); return }
+        togglePresses += 1
+        guard togglePresses == 1 else { return }          // a read is already in flight; it will count this press
         let other = otherInput.flatMap { MonitorInput.isValid($0) && $0 != mac ? $0 : nil } ?? (mac == 0x0F ? 0x12 : 0x0F)
-        switchTo(input == mac ? other : mac)
+        let gen = switchGen
+        io.read([VCP.input], info: false) { r, _, _ in
+            let presses = self.togglePresses
+            self.togglePresses = 0
+            guard gen == self.switchGen, presses % 2 == 1 else { return }   // newer explicit choice, or even presses
+            let now = r[VCP.input].map { $0.current & 0xFF } ?? self.input
+            self.switchTo(now == mac ? other : mac)
+        }
     }
 
     func label(_ code: UInt16) -> String {

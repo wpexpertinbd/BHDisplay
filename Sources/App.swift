@@ -16,6 +16,8 @@ enum Brand {
 @main
 enum Entry {
     static func main() {
+        // Take a queue ticket before anything slow, so --input runs keep the order they were launched in.
+        if CommandLine.arguments.contains("--input") { InputQueue.reserve() }
         if CommandLine.arguments.count > 1, CommandLine.arguments[1].hasPrefix("--") { CLI.run(CommandLine.arguments) }
         let app = NSApplication.shared
         let delegate = AppDelegate()
@@ -25,14 +27,61 @@ enum Entry {
     }
 }
 
-// BHDisplay --get | --input dp|hdmi1|hdmi2 | --login on|off|status
+// BHDisplay --get | --input dp|hdmi1|hdmi2|mac|other | --login on|off|status
 // Raw VCP access is for diagnostics only and must be asked for explicitly:
 //   --read CODE           CODE is hex (e.g. E2 or 0xE2)
 //   --unsafe --set CODE VALUE   VALUE is decimal, or hex with a 0x prefix
 // Commands that can wipe or power off the monitor additionally need --really.
+/// Serialises `--input` runs across processes so the LAST request always wins.
+/// `reserve()` runs first thing in main(): under a lock it takes the next ticket from a counter file, so
+/// tickets follow the order the processes were launched (no wall clock — a clock change can't stall it).
+/// `takeTurn()` re-locks and proceeds only if no newer ticket was issued meanwhile; that lock is held until
+/// the process exits, so writes to the monitor never overlap. If the lock can't be used, switching still
+/// works (unordered) and a warning is printed — a broken cache folder must not break the monitor switch.
+enum InputQueue {
+    nonisolated(unsafe) private static var lockFD: Int32 = -1
+    nonisolated(unsafe) private static var ticket: UInt64 = 0
+    private static var dir: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("com.biswashost.bhdisplay", isDirectory: true)
+    }
+    private static var counterURL: URL { dir.appendingPathComponent("input.ticket") }
+    private static func counter() -> UInt64 {
+        (try? String(contentsOf: counterURL, encoding: .utf8)).flatMap { UInt64($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 0
+    }
+
+    static func reserve() {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        lockFD = open(dir.appendingPathComponent("input.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard lockFD >= 0, flock(lockFD, LOCK_EX) == 0 else {
+            fputs("warning: switch queue unavailable (\(String(cString: strerror(errno)))); switching unordered\n", stderr)
+            lockFD = -1; return
+        }
+        ticket = counter() &+ 1
+        if ticket == 0 { ticket = 1 }                    // 0 means "unordered"; never hand it out
+        do { try String(ticket).write(to: counterURL, atomically: true, encoding: .utf8) }
+        catch { fputs("warning: switch queue not writable; switching unordered\n", stderr); ticket = 0 }
+        flock(lockFD, LOCK_UN)
+    }
+
+    static func takeTurn() -> Bool {
+        guard lockFD >= 0, ticket != 0 else { return true }
+        guard flock(lockFD, LOCK_EX) == 0 else {         // held until exit
+            fputs("warning: switch queue lock failed; switching unordered\n", stderr); return true
+        }
+        return counter() == ticket
+    }
+}
+
 enum CLI {
     /// Factory/geometry/colour restore and power mode — a typo here costs the user their settings.
     static let destructive: Set<UInt8> = [0x04, 0x05, 0x06, 0x08, 0x0A, 0xD6]
+
+    static func learned(_ key: String) -> UInt16? {
+        guard let i = UserDefaults.standard.object(forKey: key) as? Int,
+              let v = UInt16(exactly: i), MonitorInput.isValid(v) else { return nil }
+        return v
+    }
 
     static func hexCode(_ s: String) -> UInt8? {
         let t = s.lowercased().hasPrefix("0x") ? String(s.dropFirst(2)) : s
@@ -71,9 +120,26 @@ enum CLI {
                 let byName = Dictionary(uniqueKeysWithValues: MonitorInput.all.map {
                     ($0.name.lowercased().replacingOccurrences(of: " ", with: ""), $0.id) })
                 let key = args[2].lowercased()
-                guard let code = byName[key] ?? (key == "dp" ? 0x0F : nil)
-                        ?? hexCode(key).map({ UInt16($0) }).flatMap({ MonitorInput.isValid($0) ? $0 : nil })
-                else { fputs("unknown input \(args[2]) — use dp, hdmi1 or hdmi2\n", stderr); exit(2) }
+                let code: UInt16
+                if key == "mac" || key == "other" {
+                    // Ports the app learned (same preferences domain) — handy for scripts and Shortcuts.
+                    guard let mac = learned("macInput") else {
+                        fputs("the Mac's port isn't known yet — open BHDisplay once while the monitor shows the Mac\n", stderr); exit(2)
+                    }
+                    code = key == "mac" ? mac : (learned("otherInput").flatMap { $0 != mac ? $0 : nil } ?? (mac == 0x0F ? 0x12 : 0x0F))
+                } else {
+                    guard let c = byName[key] ?? (key == "dp" ? 0x0F : nil)
+                            ?? hexCode(key).map({ UInt16($0) }).flatMap({ MonitorInput.isValid($0) ? $0 : nil })
+                    else { fputs("unknown input \(args[2]) — use dp, hdmi1, hdmi2, mac or other\n", stderr); exit(2) }
+                    code = c
+                }
+                // Scripts/automation can fire several of these within a second. Run them one
+                // at a time and drop any request a newer one has replaced, so the LAST move always wins.
+                guard InputQueue.takeTurn() else { print("superseded by a newer switch"); exit(0) }
+                // Re-selecting the input that is already showing can blank some monitors for a moment.
+                if let cur = try? ddc.read(VCP.input), cur.current & 0xFF == code {
+                    print("already on \(MonitorInput.name(for: code))"); exit(0)
+                }
                 try ddc.write(VCP.input, code, repeats: 2)
                 print("switched to \(MonitorInput.name(for: code))")
             case "--read" where args.count > 2:
@@ -105,7 +171,7 @@ enum CLI {
     static func usage() -> Never {
         print("""
         usage: BHDisplay --get
-               BHDisplay --input dp|hdmi1|hdmi2
+               BHDisplay --input dp|hdmi1|hdmi2|mac|other
                BHDisplay --login on|off|status
                BHDisplay --read CODE                      (diagnostics, CODE in hex)
                BHDisplay --unsafe --set CODE VALUE        (diagnostics, raw write)
@@ -126,6 +192,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         status.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "BHDisplay")
         let menu = NSMenu(); menu.delegate = self; status.menu = menu
         registerHotKeys()
+        SharingModel.shared.refresh()
+        InputSharing.trimLog()
         m.refresh()
         // Re-read when the monitor is plugged/unplugged or wakes.
         CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
@@ -201,6 +269,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(ab)
         let o = NSMenuItem(title: "Open BHDisplay…", action: #selector(showWindow), keyEquivalent: ","); o.target = self
         menu.addItem(o)
+        // Keyboard & mouse sharing (Lan Mouse) — never changes the monitor input.
+        let sh = SharingModel.shared
+        if sh.state == .notInstalled {
+            let g = NSMenuItem(title: "Keyboard & Mouse Sharing — Get Lan Mouse…", action: #selector(getLanMouse), keyEquivalent: ""); g.target = self
+            menu.addItem(g)
+        } else {
+            let k = NSMenuItem(title: "Keyboard & Mouse Sharing", action: #selector(toggleSharing), keyEquivalent: ""); k.target = self
+            k.state = sh.state == .starting ? .mixed : (sh.isOn ? .on : .off)
+            k.isEnabled = !sh.busy
+            menu.addItem(k)
+            let st = NSMenuItem(title: "Lan Mouse Settings…", action: #selector(lanMouseSettings), keyEquivalent: ""); st.target = self
+            menu.addItem(st)
+        }
+        sh.refresh()
+        menu.addItem(.separator())
         let l = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: ""); l.target = self
         switch SMAppService.mainApp.status {
         case .enabled: l.state = .on
@@ -214,6 +297,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     @objc private func toggle() { m.toggleMacOther() }
+    @objc private func toggleSharing() { SharingModel.shared.set(!SharingModel.shared.isOn) }
+    @objc private func lanMouseSettings() { InputSharing.openSettings() }
+    @objc private func getLanMouse() { NSWorkspace.shared.open(InputSharing.releasesURL) }
 
     @objc private func showAbout() {
         let credits = NSMutableAttributedString()

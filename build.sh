@@ -36,6 +36,9 @@ PLIST
 # Ad-hoc signature with the hardened runtime (no Developer ID on this machine).
 codesign --force --options runtime --timestamp=none --sign - "$APP"
 codesign --verify --strict "$APP"
+# Keep the dev copy out of Spotlight / "Open With": only /Applications/BHDisplay.app should be registered.
+touch build/.metadata_never_index
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$APP" 2>/dev/null || true
 
 if [[ "${1:-}" == "--install" ]]; then
   DEST=/Applications/$NAME.app
@@ -47,12 +50,24 @@ if [[ "${1:-}" == "--install" ]]; then
   PAT="^${DEST//./\\.}/Contents/MacOS/$NAME( |\$)"
   pkill -f "$PAT" 2>/dev/null || true
   for i in {1..10}; do pgrep -f "$PAT" >/dev/null || break; sleep 0.5; done
-  if [[ -e "$DEST" ]]; then rm -rf "$DEST.old"; mv "$DEST" "$DEST.old"; fi
+  # Never delete the old copy: after a .pkg install it is owned by root, which a normal user can only
+  # RENAME inside /Applications (not delete, not move to the Trash). Trash it if allowed, else park it.
+  OLD=""
+  if [[ -e "$DEST" ]]; then
+    OLD="$HOME/.Trash/$NAME-replaced-$(date +%Y%m%d-%H%M%S).app"
+    if mv "$DEST" "$OLD" 2>/dev/null; then
+      /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$OLD" 2>/dev/null || true
+    else
+      OLD="/Applications/$NAME-old-$(date +%Y%m%d-%H%M%S).app"
+      mv "$DEST" "$OLD"
+      /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$OLD" 2>/dev/null || true
+      echo "note: previous copy is owned by root (installed by the .pkg) — parked as $OLD; delete it in Finder" >&2
+    fi
+  fi
   if ! mv "$STAGE" "$DEST"; then                     # roll back rather than leave no app
-    [[ -e "$DEST.old" ]] && mv "$DEST.old" "$DEST"
+    [[ -n "$OLD" ]] && mv "$OLD" "$DEST"
     echo "install failed; previous version restored" >&2; exit 1
   fi
-  rm -rf "$DEST.old"
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST"
   open "$DEST"
   echo "Installed $DEST"

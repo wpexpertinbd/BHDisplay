@@ -53,7 +53,7 @@ struct ContentView: View {
             HStack(alignment: .top, spacing: 14) {
                 VStack(spacing: 14) { monitorCard; inputCard; infoCard }
                     .frame(width: 400)
-                VStack(spacing: 14) { displayCard; viewModeCard; colorCard }
+                VStack(spacing: 14) { displayCard; viewModeCard; colorCard; sharingCard }
                     .frame(width: 430)
             }
             .disabled(m.input == nil && m.error != nil)
@@ -214,6 +214,37 @@ struct ContentView: View {
             }
             .labelsHidden()
         }
+    }
+
+    @ObservedObject private var sharing = SharingModel.shared
+
+    private var sharingCard: some View {
+        Card(title: "Keyboard & Mouse", icon: "keyboard", trailing: {
+            if sharing.state != .notInstalled {
+                Toggle("", isOn: Binding(get: { sharing.isOn }, set: { sharing.set($0) }))
+                    .toggleStyle(.switch).labelsHidden().tint(accent)
+                    .disabled(sharing.busy)
+            }
+        }) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(sharing.statusText).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                if let e = sharing.error {
+                    Text(e).font(.system(size: 11)).foregroundStyle(.orange)
+                }
+                HStack {
+                    if sharing.state == .notInstalled {
+                        Button("Get Lan Mouse (free)…") { NSWorkspace.shared.open(InputSharing.releasesURL) }
+                    } else {
+                        Button("Lan Mouse Settings…") { InputSharing.openSettings() }
+                    }
+                    Spacer()
+                    Text("Moving the mouse never changes the monitor.").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                .controlSize(.small)
+            }
+        }
+        .onAppear { sharing.refresh() }
     }
 
     private var colorCard: some View {
