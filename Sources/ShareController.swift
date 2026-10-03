@@ -35,6 +35,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     private var pairIntent: Data?                    // fingerprint prefix the user asked to pair with
     private var dialing: Set<String> = []
     private var lastPairPrompt = Date.distantPast
+    /// Last address each paired peer was reached at — lets us reconnect without discovery.
+    private var peerHosts: [String: String] = UserDefaults.standard.dictionary(forKey: "sharePeerHosts") as? [String: String] ?? [:]
+    private var reconnectTimer: Timer?
 
     private override init() {
         let d = UserDefaults.standard
@@ -75,12 +78,37 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         discovery.onBeacon = { [weak self] b in Task { @MainActor in self?.beacon(b) } }
         discovery.start(identity: identity, queue: q)
         running = true
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reconnectKnownPeers() }
+        }
         updateStatus()
+    }
+
+    /// Discovery can be blocked (firewalls, multi-adapter PCs); TCP usually is not. While disconnected,
+    /// dial every paired peer at its last known address.
+    private func reconnectKnownPeers() {
+        guard running, session == nil, pairing == nil, let identity else { return }
+        for (fp, host) in peerHosts where paired[fp] != nil && !dialing.contains(host) {
+            dialing.insert(host)
+            let s = ShareSession.dial(host: host, port: BHDS.tcpPort, identity: identity, queue: q)
+            q.asyncAfter(deadline: .now() + 10) { [weak self] in Task { @MainActor in self?.dialing.remove(host) } }
+            q.async { self.adopt(s) }
+        }
+    }
+
+    /// Manual fallback when the other computer can't be found automatically.
+    func connect(toHost host: String) {
+        guard running, let identity, !host.isEmpty else { return }
+        pairIntent = nil
+        let s = ShareSession.dial(host: host, port: BHDS.tcpPort, identity: identity, queue: q)
+        q.async { self.adopt(s) }
+        status = "Connecting to \(host)…"
     }
 
     func stop() {
         guard running || needsAccessibility else { return }
         running = false
+        reconnectTimer?.invalidate(); reconnectTimer = nil
         capture.stop()
         emulator.leave()
         controlling = false; controlled = false
@@ -135,6 +163,8 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     func forget(_ fingerprintHex: String) {
         paired.removeValue(forKey: fingerprintHex)
         UserDefaults.standard.set(paired, forKey: "sharePaired")
+        peerHosts.removeValue(forKey: fingerprintHex)
+        UserDefaults.standard.set(peerHosts, forKey: "sharePeerHosts")
         if session?.peerFingerprint.hex == fingerprintHex { session?.close("forgotten") }
     }
 
@@ -151,9 +181,16 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         guard running else { s.close("not running"); return }
         let fp = s.peerFingerprint.hex
         if paired[fp] != nil {
-            if let old = session, old !== s { old.close("replaced by a newer connection") }
             pending.removeValue(forKey: ObjectIdentifier(s))
+            if let old = session, old !== s {
+                // Both sides may dial at once. Keep the connection dialed by the lower device id — both
+                // computers apply the same rule, so they always agree on which one survives.
+                guard isPreferred(s) else { s.close("duplicate connection"); return }
+                old.close("duplicate connection")
+            }
             session = s
+            peerHosts[fp] = s.remoteHost
+            UserDefaults.standard.set(peerHosts, forKey: "sharePeerHosts")
             connectedName = s.peer?.name
             discovered.removeAll { $0.fpPrefix == s.peerFingerprint.prefix(8) }
             sendMonitorPorts()
@@ -168,6 +205,11 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             Task { @MainActor in if self?.pairing?.session === s { s.close("pairing timed out") } }
         }
         promptPairing(s)
+    }
+
+    private func isPreferred(_ s: ShareSession) -> Bool {
+        guard let me = identity?.deviceID, let peer = s.peer?.deviceID else { return true }
+        return (s.role == .dialer) == me.lexicographicallyPrecedes(peer)
     }
 
     private func promptPairing(_ s: ShareSession) {

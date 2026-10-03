@@ -64,6 +64,7 @@ internal sealed class Settings
     public bool Sharing { get; set; } = true;
     public int MacEdge { get; set; } = 0;                  // the Mac is on the left of this PC
     public Dictionary<string, string> Paired { get; set; } = [];
+    public Dictionary<string, string> PeerHosts { get; set; } = [];   // fingerprint → last IPv4 the peer was reached at
     public byte MacPort { get; set; } = 0x12;              // updated from the Mac (MONITOR_PORTS)
     public byte PcPort { get; set; } = 0x0F;
 
@@ -78,6 +79,8 @@ internal sealed class Settings
             if (!Ddc.IsInput(s.MacPort)) s.MacPort = 0x12;    // never trust a hand-edited value
             if (!Ddc.IsInput(s.PcPort)) s.PcPort = 0x0F;
             if (s.MacEdge is not (0 or 1)) s.MacEdge = 0;
+            s.PeerHosts = s.PeerHosts.Where(kv => System.Net.IPAddress.TryParse(kv.Value, out var a)
+                && a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToDictionary();
             return s;
         }
         catch { return new(); }

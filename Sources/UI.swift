@@ -252,6 +252,9 @@ struct ContentView: View {
                             Button("Forget") { share.forget(fp) }.controlSize(.small)
                         }
                     }
+                    if share.connectedName == nil {
+                        Button("Connect by IP address…") { askForAddress() }.controlSize(.small)
+                    }
                     HStack(spacing: 8) {
                         Text("Other computer is on the").font(.system(size: 12))
                         Picker("", selection: Binding(get: { share.side }, set: { share.side = $0 })) {
@@ -269,6 +272,22 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private func askForAddress() {
+        let a = NSAlert()
+        a.messageText = "Connect to another computer"
+        a.informativeText = "Enter the IP address of the computer running BHDisplay (on Windows: hover the tray icon, or run ipconfig)."
+        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        f.placeholderString = "192.168.0.201"
+        a.accessoryView = f
+        a.addButton(withTitle: "Connect"); a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = f
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let host = f.stringValue.trimmingCharacters(in: .whitespaces)
+        var addr = in_addr()
+        guard inet_pton(AF_INET, host, &addr) == 1 else { NSSound.beep(); return }   // IPv4 literals only
+        share.connect(toHost: host)
     }
 
     private var colorCard: some View {

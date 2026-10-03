@@ -241,6 +241,7 @@ final class ShareDiscovery: @unchecked Sendable {
         w.bytes(identity.fingerprint.prefix(8))
         let n = Data(identity.name.utf8).prefix(64); w.u8(UInt8(n.count)); w.bytes(n)
         let beacon = w.data
+        self.beacon = beacon
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: 2)
         t.setEventHandler { [weak self] in self?.broadcast(beacon) }
@@ -254,13 +255,47 @@ final class ShareDiscovery: @unchecked Sendable {
         if fd >= 0 { Darwin.close(fd); fd = -1 }
     }
 
+    private var beacon = Data()
+    private var lastReply: [String: Date] = [:]
+
+    /// The limited broadcast (255.255.255.255) can leave through the wrong adapter on machines with several
+    /// (VPN, virtual switches), so also send to every up, non-loopback IPv4 interface's own subnet broadcast.
     private func broadcast(_ payload: Data) {
+        var targets: Set<UInt32> = [INADDR_BROADCAST]
+        var list: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&list) == 0, let first = list {
+            var p: UnsafeMutablePointer<ifaddrs>? = first
+            while let i = p {
+                let f = Int32(i.pointee.ifa_flags)
+                if f & IFF_UP != 0, f & IFF_LOOPBACK == 0, f & IFF_BROADCAST != 0,
+                   let a = i.pointee.ifa_addr, a.pointee.sa_family == sa_family_t(AF_INET),
+                   let b = i.pointee.ifa_dstaddr {
+                    _ = b.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { targets.insert($0.pointee.sin_addr.s_addr) }
+                }
+                p = i.pointee.ifa_next
+            }
+            freeifaddrs(first)
+        }
+        for t in targets { send(payload, to: t) }
+    }
+
+    /// Unicast our beacon straight back to a device we heard, so discovery works even if broadcasts
+    /// only get through in one direction.
+    private func reply(to host: String) {
+        guard Date().timeIntervalSince(lastReply[host] ?? .distantPast) > 5 else { return }
+        lastReply[host] = Date()
+        var a = in_addr()
+        guard inet_pton(AF_INET, host, &a) == 1 else { return }
+        send(beacon, to: a.s_addr)
+    }
+
+    private func send(_ payload: Data, to address: UInt32) {
         guard fd >= 0 else { return }
         var to = sockaddr_in()
         to.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         to.sin_family = sa_family_t(AF_INET)
         to.sin_port = BHDS.udpPort.bigEndian
-        to.sin_addr.s_addr = INADDR_BROADCAST
+        to.sin_addr.s_addr = address
         _ = payload.withUnsafeBytes { buf in
             withUnsafePointer(to: &to) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -287,7 +322,9 @@ final class ShareDiscovery: @unchecked Sendable {
             var ip = from.sin_addr
             var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             inet_ntop(AF_INET, &ip, &text, socklen_t(INET_ADDRSTRLEN))
-            onBeacon?(Beacon(deviceID: id, host: String(cString: text), port: port, fingerprintPrefix: fp,
+            let host = String(cString: text)
+            reply(to: host)
+            onBeacon?(Beacon(deviceID: id, host: host, port: port, fingerprintPrefix: fp,
                              name: String(decoding: nameData, as: UTF8.self)))
         }
     }

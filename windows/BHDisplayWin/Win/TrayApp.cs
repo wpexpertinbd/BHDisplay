@@ -26,6 +26,7 @@ internal sealed class TrayApp : ApplicationContext
     private bool _running, _controlling, _controlled;
     private uint _clipSeq;
     private string _status = "Off";
+    private readonly System.Windows.Forms.Timer _reconnect = new() { Interval = 5000 };
 
     [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
 
@@ -47,10 +48,23 @@ internal sealed class TrayApp : ApplicationContext
         _capture.Captured = m => { if (_controlling) _session?.Send(m); };
         _capture.LocalHotkey = h => OnLocalHotkey(h);
         _emu.Left = pos => PeerPointerLeft(pos);
+        _reconnect.Tick += (_, _) => ReconnectKnownPeers();
 
-        if (FirstRun()) { SetStartWithWindows(true); _settings.Save(); }   // default on once; the user's later choice sticks
+        Log.Write("tray icon created");
+        // Everything else runs once the message loop is pumping: low-level hooks are serviced by that loop,
+        // and nothing here may delay the tray icon from responding.
+        _ui.Post(_ => Startup(), null);
+    }
+
+    private void Startup()
+    {
+        Log.Write("startup: message loop running");
+        if (FirstRun()) { SetStartWithWindows(true); _settings.Save(); Log.Write("first run: start with Windows on"); }
         if (_settings.Sharing) StartSharing();
         UpdateStatus();
+        _icon.ShowBalloonTip(5000, "BHDisplay is running",
+            "It lives in the system tray (click ^ next to the clock if you don't see it). Right-click the icon for options.", ToolTipIcon.Info);
+        Log.Write("tray ready: " + _status);
     }
 
     private void Post(Action a) => _ui.Post(_ => a(), null);
@@ -100,22 +114,77 @@ internal sealed class TrayApp : ApplicationContext
     private void StartSharing()
     {
         if (_running) return;
-        try { _id = ShareIdentity.LoadOrCreate(Settings.LoadIdentity, Settings.SaveIdentity, Environment.MachineName); }
-        catch (Exception e) { _status = "Can't create identity: " + e.Message; return; }
-        if (!_capture.Start()) { _status = "Can't capture input (hooks failed)"; return; }
-        _listener.Session += s => Post(() => Adopt(s));
-        _listener.Error += e => Post(() => { _status = e; UpdateStatus(); });
-        _listener.Start(_id);
-        _discovery.Found += b => Post(() => OnBeacon(b));
-        _discovery.Start(_id);
+        try
+        {
+            Log.Write("sharing: loading identity");
+            _id = ShareIdentity.LoadOrCreate(Settings.LoadIdentity, Settings.SaveIdentity, Environment.MachineName);
+            Log.Write($"sharing: identity ok ({_id.Name}); installing input hooks");
+            if (!_capture.Start()) { _status = "Can't capture input (hooks failed)"; Log.Write(_status); return; }
+            Log.Write("sharing: hooks ok; listening on TCP " + Bhds.TcpPort);
+            _listener.Session += s => Post(() => Adopt(s));
+            _listener.Error += e => Post(() => { _status = e; Log.Write(e); UpdateStatus(keepStatus: true); });
+            _listener.Start(_id);
+            Log.Write("sharing: listening; starting discovery on UDP " + Bhds.UdpPort);
+            _discovery.Found += b => Post(() => OnBeacon(b));
+            _discovery.Start(_id);
+            Log.Write("sharing: discovery started");
+        }
+        catch (Exception e)
+        {
+            _status = "Sharing couldn't start: " + e.Message;
+            Log.Write("StartSharing failed: " + e);
+            return;
+        }
         _running = true;
+        _reconnect.Start();
         UpdateStatus();
     }
+
+    /// Discovery can be blocked (firewalls, multi-adapter PCs); TCP usually is not. While disconnected,
+    /// dial every paired peer at its last known address.
+    private void ReconnectKnownPeers()
+    {
+        if (!_running || _session is not null || _pairing is not null) return;
+        foreach (var (fp, host) in _settings.PeerHosts)
+            if (_settings.Paired.ContainsKey(fp) && _dialing.Add(host)) _ = Dial(host, Bhds.TcpPort, () => _dialing.Remove(host));
+    }
+
+    private bool IsPreferred(ShareSession s)
+    {
+        if (_id is null || s.Peer is null) return true;
+        bool meLower = _id.DeviceId.AsSpan().SequenceCompareTo(s.Peer.DeviceId) < 0;
+        return (s.Role == Role.Dialer) == meLower;
+    }
+
+    private void AskForAddress()
+    {
+        using var f = new Form { Text = "BHDisplay — connect to the Mac", Width = 380, Height = 160, FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false, TopMost = true };
+        var label = new Label { Text = "IP address of the Mac running BHDisplay:", Left = 12, Top = 14, Width = 340 };
+        var box = new TextBox { Left = 12, Top = 38, Width = 340, PlaceholderText = "192.168.0.123" };
+        var ok = new Button { Text = "Connect", Left = 196, Top = 72, Width = 75, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Left = 277, Top = 72, Width = 75, DialogResult = DialogResult.Cancel };
+        f.Controls.AddRange([label, box, ok, cancel]); f.AcceptButton = ok; f.CancelButton = cancel;
+        if (f.ShowDialog() != DialogResult.OK) return;
+        if (!System.Net.IPAddress.TryParse(box.Text.Trim(), out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+        { MessageBox.Show("That isn't an IPv4 address.", "BHDisplay"); return; }
+        _status = $"Connecting to {ip}…"; UpdateStatus(keepStatus: true);
+        _ = Dial(ip.ToString(), Bhds.TcpPort, () => { });
+    }
+
+    private static string LocalAddresses() => string.Join(", ",
+        System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up
+                     && n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
+            .SelectMany(n => n.GetIPProperties().UnicastAddresses)
+            .Where(a => a.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            .Select(a => a.Address.ToString()));
 
     private void StopSharing()
     {
         if (!_running) return;
         _running = false;
+        _reconnect.Stop();
         _capture.End(null); _capture.Dispose();
         _emu.Leave(); _controlling = _controlled = false;
         _discovery.Stop(); _listener.Stop();
@@ -129,10 +198,12 @@ internal sealed class TrayApp : ApplicationContext
     private bool IsPaired(byte[] prefix) =>
         _settings.Paired.Keys.Any(k => Convert.FromHexString(k).AsSpan(0, 8).SequenceEqual(prefix));
 
+    private readonly HashSet<string> _loggedBeacons = [];
     private void OnBeacon(Beacon b)
     {
         if (!_running || _id is null) return;
         var key = P256.Hex(b.DeviceId);
+        if (_loggedBeacons.Add(key)) Log.Write($"discovered {b.Name} at {b.Host}:{b.Port} (paired: {IsPaired(b.FingerprintPrefix)})");
         if (IsPaired(b.FingerprintPrefix))
         {
             _unpaired.Remove(key);
@@ -164,12 +235,19 @@ internal sealed class TrayApp : ApplicationContext
 
     private void OnReady(ShareSession s)
     {
+        Log.Write($"session ready: {s.Peer?.Name} @ {s.RemoteHost}");
         if (!_running) { s.Close("not running"); return; }
         var fp = P256.Hex(s.PeerFingerprint);
         if (_settings.Paired.ContainsKey(fp))
         {
-            if (_session is { } old && old != s) old.Close("replaced by a newer connection");
+            if (_session is { } old && old != s)
+            {
+                // Both sides may dial at once: keep the connection dialed by the lower device id (both apply this rule).
+                if (!IsPreferred(s)) { s.Close("duplicate connection"); return; }
+                old.Close("duplicate connection");
+            }
             _session = s;
+            _settings.PeerHosts[fp] = s.RemoteHost; _settings.Save();
             UpdateStatus();
             return;
         }
@@ -206,6 +284,7 @@ internal sealed class TrayApp : ApplicationContext
 
     private void OnClosed(ShareSession s, string why)
     {
+        Log.Write($"session {s.RemoteHost} closed: {why}");
         if (_pairing?.S == s) _pairing = null;
         if (_session != s) return;
         _session = null;
@@ -323,12 +402,15 @@ internal sealed class TrayApp : ApplicationContext
         if (_settings.Sharing)
         {
             _menu.Items.Add(new ToolStripMenuItem("    " + _status) { Enabled = false });
+            _menu.Items.Add(new ToolStripMenuItem("    This PC: " + LocalAddresses()) { Enabled = false });
+            if (_session is null)
+                _menu.Items.Add(new ToolStripMenuItem("    Connect to the Mac by IP address…", null, (_, _) => AskForAddress()));
             foreach (var (_, (b, _)) in _unpaired)
                 _menu.Items.Add(new ToolStripMenuItem($"    Pair with {b.Name}…", null, (_, _) => _ = Dial(b.Host, b.Port, () => { })));
             foreach (var (fp, name) in _settings.Paired.ToList())
                 _menu.Items.Add(new ToolStripMenuItem($"    Forget {name}", null, (_, _) =>
                 {
-                    _settings.Paired.Remove(fp); _settings.Save();
+                    _settings.Paired.Remove(fp); _settings.PeerHosts.Remove(fp); _settings.Save();
                     if (_session is { } s && P256.Hex(s.PeerFingerprint) == fp) s.Close("forgotten");
                 }));
             var side = new ToolStripMenuItem("    The Mac is on the");

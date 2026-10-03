@@ -189,6 +189,8 @@ public sealed class ShareDiscovery
 {
     private UdpClient? _udp;
     private Timer? _timer;
+    private byte[] _beacon = [];
+    private readonly Dictionary<string, long> _lastReply = [];
     public event Action<Beacon>? Found;
 
     public void Start(ShareIdentity id, int tcpPort = Bhds.TcpPort)
@@ -201,11 +203,8 @@ public sealed class ShareDiscovery
         w.Bytes(Bhds.BeaconMagic); w.Bytes(id.DeviceId); w.U16((ushort)tcpPort); w.Bytes(id.Fingerprint.AsSpan(0, 8));
         var n = Encoding.UTF8.GetBytes(id.Name); if (n.Length > 64) n = n[..64];
         w.U8((byte)n.Length); w.Bytes(n);
-        var beacon = w.ToArray();
-        _timer = new Timer(_ =>
-        {
-            try { _udp?.Send(beacon, beacon.Length, new IPEndPoint(IPAddress.Broadcast, Bhds.UdpPort)); } catch { }
-        }, null, 0, 2000);
+        _beacon = w.ToArray();
+        _timer = new Timer(_ => { foreach (var t in BroadcastTargets()) Send(t); }, null, 0, 2000);
         _ = Task.Run(async () =>
         {
             while (_udp is { } c)
@@ -213,12 +212,59 @@ public sealed class ShareDiscovery
                 try
                 {
                     var r = await c.ReceiveAsync();
-                    if (TryParse(r.Buffer, r.RemoteEndPoint.Address.ToString(), id.DeviceId) is { } b) Found?.Invoke(b);
+                    if (TryParse(r.Buffer, r.RemoteEndPoint.Address.ToString(), id.DeviceId) is { } b)
+                    {
+                        Reply(r.RemoteEndPoint.Address);
+                        Found?.Invoke(b);
+                    }
                 }
                 catch (Exception) when (_udp is null) { return; }
                 catch (Exception) { await Task.Delay(200); }
             }
         });
+    }
+
+    private void Send(IPAddress to)
+    {
+        try { _udp?.Send(_beacon, _beacon.Length, new IPEndPoint(to, Bhds.UdpPort)); } catch { }
+    }
+
+    /// Unicast our beacon straight back to a device we heard, so discovery works even if broadcasts
+    /// only get through in one direction.
+    private void Reply(IPAddress host)
+    {
+        var key = host.ToString(); var now = Environment.TickCount64;
+        lock (_lastReply)
+        {
+            if (_lastReply.TryGetValue(key, out var t) && now - t < 5000) return;
+            _lastReply[key] = now;
+        }
+        Send(host);
+    }
+
+    /// 255.255.255.255 often leaves through the wrong adapter on PCs with several (VPN, Hyper-V, VirtualBox),
+    /// so also send to each up, non-loopback IPv4 interface's own subnet broadcast address.
+    private static IEnumerable<IPAddress> BroadcastTargets()
+    {
+        var set = new HashSet<IPAddress> { IPAddress.Broadcast };
+        try
+        {
+            foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up
+                    || ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                {
+                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork || ua.IPv4Mask is null) continue;
+                    var ip = ua.Address.GetAddressBytes(); var mask = ua.IPv4Mask.GetAddressBytes();
+                    var b = new byte[4];
+                    for (int i = 0; i < 4; i++) b[i] = (byte)(ip[i] | ~mask[i]);
+                    set.Add(new IPAddress(b));
+                }
+            }
+        }
+        catch { }
+        return set;
     }
 
     public static Beacon? TryParse(byte[] buf, string host, byte[] ownId)
