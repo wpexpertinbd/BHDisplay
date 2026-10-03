@@ -14,7 +14,7 @@
     <RootNamespace>BHDisplay.Win</RootNamespace>
     <ApplicationIcon>BHDisplay.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <Product>BHDisplay</Product>
     <Company>BiswasHost</Company>
     <Copyright>© 2026 BiswasHost</Copyright>
