@@ -100,7 +100,7 @@ internal sealed class Capture : IDisposable
         {
             case WM_MOUSEMOVE:
                 int dx = m.pt.X - _park.X, dy = m.pt.Y - _park.Y;
-                if (dx != 0 || dy != 0) Captured?.Invoke(new ShareMsg.Move((short)Math.Clamp(dx, short.MinValue, short.MaxValue), (short)Math.Clamp(dy, short.MinValue, short.MaxValue)));
+                if (dx != 0 || dy != 0) Captured?.Invoke(new ShareMsg.Move((short)Num.Clamp(dx, short.MinValue, short.MaxValue), (short)Num.Clamp(dy, short.MinValue, short.MaxValue)));
                 break;
             case WM_LBUTTONDOWN or WM_LBUTTONUP: Captured?.Invoke(new ShareMsg.Button(1, msg == WM_LBUTTONDOWN)); break;
             case WM_RBUTTONDOWN or WM_RBUTTONUP: Captured?.Invoke(new ShareMsg.Button(2, msg == WM_RBUTTONDOWN)); break;

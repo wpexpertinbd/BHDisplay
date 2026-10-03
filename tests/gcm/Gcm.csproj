@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Checks the Windows app's own AES-GCM, HKDF and key agreement (Core/Compat.cs) against published test
+       vectors and against .NET's built-in implementations. Run: dotnet run -c Release -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../windows/BHDisplayWin/Core/Compat.cs" />
+  </ItemGroup>
+</Project>

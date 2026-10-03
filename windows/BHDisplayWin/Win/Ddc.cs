@@ -1,6 +1,6 @@
 // Monitor input switching over DDC/CI with Windows' Monitor Configuration API (dxva2), and app settings.
 using System.Runtime.InteropServices;
-using System.Text.Json;
+using System.Web.Script.Serialization;
 using static BHDisplay.Win.Native;
 
 namespace BHDisplay.Win;
@@ -27,8 +27,8 @@ internal static class Ddc
                 if (!GetPhysicalMonitorsFromHMONITOR(hm, n, arr)) continue;
                 foreach (var pm in arr) found.Add((pm.hPhysicalMonitor, pm.szPhysicalMonitorDescription ?? "", arr));
             }
-            var ordered = found.OrderByDescending(f => f.Desc.Contains("ViewSonic", StringComparison.OrdinalIgnoreCase)
-                                                    || f.Desc.Contains("XG2409", StringComparison.OrdinalIgnoreCase));
+            var ordered = found.OrderByDescending(f => f.Desc.IndexOf("ViewSonic", StringComparison.OrdinalIgnoreCase) >= 0
+                                                    || f.Desc.IndexOf("XG2409", StringComparison.OrdinalIgnoreCase) >= 0);
             foreach (var f in ordered)
             {
                 if (GetVCPFeatureAndVCPFeatureReply(f.H, VcpInput, out _, out _, out _)) return action(f.H, f.Desc);
@@ -63,8 +63,8 @@ internal sealed class Settings
 {
     public bool Sharing { get; set; } = true;
     public int MacEdge { get; set; } = 0;                  // the Mac is on the left of this PC
-    public Dictionary<string, string> Paired { get; set; } = [];
-    public Dictionary<string, string> PeerHosts { get; set; } = [];   // fingerprint → last IPv4 the peer was reached at
+    public Dictionary<string, string> Paired { get; set; } = new();
+    public Dictionary<string, string> PeerHosts { get; set; } = new();   // fingerprint → last IPv4 the peer was reached at
     public byte MacPort { get; set; } = 0x12;              // updated from the Mac (MONITOR_PORTS)
     public byte PcPort { get; set; } = 0x0F;
 
@@ -75,13 +75,14 @@ internal sealed class Settings
     {
         try
         {
-            var s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new();
+            var s = new JavaScriptSerializer().Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new();
+            s.Paired ??= new(); s.PeerHosts ??= new();
             if (!Ddc.IsInput(s.MacPort)) s.MacPort = 0x12;    // never trust a hand-edited value
             if (!Ddc.IsInput(s.PcPort)) s.PcPort = 0x0F;
             if (s.MacEdge is not (0 or 1)) s.MacEdge = 0;
-            s.Paired = s.Paired.Where(kv => kv.Key.Length == 64 && kv.Key.All(Uri.IsHexDigit)).ToDictionary();
+            s.Paired = s.Paired.Where(kv => kv.Key.Length == 64 && kv.Key.All(Uri.IsHexDigit)).ToDictionary(kv => kv.Key, kv => kv.Value);
             s.PeerHosts = s.PeerHosts.Where(kv => System.Net.IPAddress.TryParse(kv.Value, out var a)
-                && a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToDictionary();
+                && a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToDictionary(kv => kv.Key, kv => kv.Value);
             return s;
         }
         catch { return new(); }
@@ -91,8 +92,8 @@ internal sealed class Settings
     {
         Directory.CreateDirectory(Dir);
         var tmp = FilePath + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
-        File.Move(tmp, FilePath, true);
+        File.WriteAllText(tmp, new JavaScriptSerializer().Serialize(this));
+        if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null); else File.Move(tmp, FilePath);
     }
 
     public static byte[]? LoadIdentity()

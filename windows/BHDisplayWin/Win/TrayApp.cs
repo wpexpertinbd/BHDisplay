@@ -20,7 +20,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly Emulator _emu = new();
     private ShareSession? _session;
     private (ShareSession S, bool Local, bool Remote)? _pairing;
-    private readonly Dictionary<string, (Beacon B, DateTime Seen)> _unpaired = [];
+    private readonly Dictionary<string, (Beacon B, DateTime Seen)> _unpaired = new();
     private readonly HashSet<string> _dialing = [];
     private DateTime _lastPrompt = DateTime.MinValue;
     private DateTime _pairArmedUntil = DateTime.MinValue;   // new pairings accepted only after the user asks, for 2 min
@@ -37,7 +37,7 @@ internal sealed class TrayApp : ApplicationContext
     private uint _clipSeq;
     private bool _showsPc;                                 // the shared monitor currently shows this PC
     private long _lastHandover;                            // no bouncing straight back across the boundary
-    private bool RecentHandover => Environment.TickCount64 - _lastHandover < 250;
+    private bool RecentHandover => Num.NowMs - _lastHandover < 250;
     private string _status = "Off";
     private readonly System.Windows.Forms.Timer _reconnect = new() { Interval = 5000 };
 
@@ -262,7 +262,7 @@ internal sealed class TrayApp : ApplicationContext
     private bool IsPreferred(ShareSession s)
     {
         if (_id is null || s.Peer is null) return true;
-        bool meLower = _id.DeviceId.AsSpan().SequenceCompareTo(s.Peer.DeviceId) < 0;
+        bool meLower = Bytes.Compare(_id.DeviceId, s.Peer.DeviceId) < 0;
         return (s.Role == Role.Dialer) == meLower;
     }
 
@@ -270,8 +270,8 @@ internal sealed class TrayApp : ApplicationContext
     {
         using var f = new Form { Text = "BHDisplay — connect to the Mac", Width = 380, Height = 160, FormBorderStyle = FormBorderStyle.FixedDialog,
             StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false, TopMost = true };
-        var label = new Label { Text = "IP address of the Mac running BHDisplay:", Left = 12, Top = 14, Width = 340 };
-        var box = new TextBox { Left = 12, Top = 38, Width = 340, PlaceholderText = "192.168.0.123" };
+        var label = new Label { Text = "IP address of the Mac running BHDisplay (e.g. 192.168.0.123):", Left = 12, Top = 14, Width = 340 };
+        var box = new TextBox { Left = 12, Top = 38, Width = 340 };
         var ok = new Button { Text = "Connect", Left = 196, Top = 72, Width = 75, DialogResult = DialogResult.OK };
         var cancel = new Button { Text = "Cancel", Left = 277, Top = 72, Width = 75, DialogResult = DialogResult.Cancel };
         f.Controls.AddRange([label, box, ok, cancel]); f.AcceptButton = ok; f.CancelButton = cancel;
@@ -307,7 +307,7 @@ internal sealed class TrayApp : ApplicationContext
     }
 
     private bool IsPaired(byte[] prefix) =>
-        _settings.Paired.Keys.Any(k => Convert.FromHexString(k).AsSpan(0, 8).SequenceEqual(prefix));
+        _settings.Paired.Keys.Any(k => Bytes.FromHex(k) is { Length: 32 } f && Bytes.Equal(Bytes.Slice(f, 0, 8), prefix));
 
     private readonly HashSet<string> _loggedBeacons = [];
     private void OnBeacon(Beacon b)
@@ -321,7 +321,7 @@ internal sealed class TrayApp : ApplicationContext
             _unpaired.Remove(key);
             // Lower device id dials; the other side waits for it.
             // Keyed by address, only our own port, a few at a time: a forged beacon can't make us dial around.
-            if (_session is null && _id.DeviceId.AsSpan().SequenceCompareTo(b.DeviceId) < 0 && _dialing.Count < 4 && _dialing.Add(b.Host))
+            if (_session is null && Bytes.Compare(_id.DeviceId, b.DeviceId) < 0 && _dialing.Count < 4 && _dialing.Add(b.Host))
             {
                 _ = Dial(b.Host, Bhds.TcpPort, () => _dialing.Remove(b.Host));
             }
@@ -381,7 +381,7 @@ internal sealed class TrayApp : ApplicationContext
         _pairing = (s, false, false);
         _ = Task.Delay(60000).ContinueWith(_ => Post(() => { if (_pairing?.S == s) s.Close("pairing timed out"); }));
         var name = s.Peer?.Name ?? "another computer";
-        var code = s.PairCode[..3] + " " + s.PairCode[3..];
+        var code = s.PairCode.Substring(0, 3) + " " + s.PairCode.Substring(3);
         var sameName = _settings.Paired.ContainsValue(name)
             ? $"\n\n⚠ A computer named “{name}” is already paired — this is a DIFFERENT computer using that name." : "";
         _promptOpen = true;
@@ -443,7 +443,7 @@ internal sealed class TrayApp : ApplicationContext
                 {   // the Mac tells us which of our edges faces it (from its display arrangement)
                     _settings.MacEdge = e.Edge; _settings.Save(); _capture.Edge = _emu.Edge = e.Edge;
                 }
-                _emu.Enter(e.Position, takeover: e.Edge == 4); _controlled = true; _lastHandover = Environment.TickCount64;
+                _emu.Enter(e.Position, takeover: e.Edge == 4); _controlled = true; _lastHandover = Num.NowMs;
                 Log.Write($"← the Mac is controlling this PC ({(e.Edge == 4 ? "take-over" : "came across")})");
                 break;
             case ShareMsg.Leave l:
@@ -470,7 +470,7 @@ internal sealed class TrayApp : ApplicationContext
     private bool EdgeHit(float pos)
     {
         if (!_running || _session is null || RecentHandover) return false;
-        _lastHandover = Environment.TickCount64;
+        _lastHandover = Num.NowMs;
         if (_controlled) { _emu.Leave(); _controlled = false; }   // our own mouse wins: the Mac's pointer was here
         Post(SendClipboardIfChanged);                       // clipboard can block: not inside the hook
         Log.Write("→ controlling the Mac (pointer crossed the edge)");
@@ -485,7 +485,7 @@ internal sealed class TrayApp : ApplicationContext
         // No time guard here: the emulator has already let go, so the Mac MUST be told, or it keeps sending into nothing.
         if (!_controlled || _session is null) return;
         _controlled = false;
-        _lastHandover = Environment.TickCount64;
+        _lastHandover = Num.NowMs;
         Log.Write("→ pointer reached the edge: back to the Mac");
         SendClipboardIfChanged();
         _session.Send(new ShareMsg.Leave((byte)_settings.MacEdge, pos));
@@ -534,7 +534,7 @@ internal sealed class TrayApp : ApplicationContext
                     : $"Waiting for {string.Join(", ", _settings.Paired.Values)}…";
         }
         var t = "BHDisplay — " + _status;
-        _icon.Text = t.Length > 63 ? t[..63] : t;
+        _icon.Text = t.Length > 63 ? t.Substring(0, 63) : t;
     }
 
     private void BuildMenu()

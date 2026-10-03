@@ -19,8 +19,11 @@ internal static class Installer
     public static string InstalledExe => Path.Combine(InstallDir, "BHDisplay.exe");
     private static string Shortcut => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "BHDisplay.lnk");
 
+    /// This program's own path (Environment.ProcessPath does not exist on .NET Framework).
+    public static string ExePath => Application.ExecutablePath;
+
     public static bool IsInstalledCopy =>
-        string.Equals(Path.GetFullPath(Environment.ProcessPath ?? ""), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase);
+        string.Equals(Path.GetFullPath(ExePath), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase);
 
     /// Install or update from the downloaded file, then start the installed copy.
     public static void Install()
@@ -32,7 +35,7 @@ internal static class Installer
             bool firstInstall = Registry.CurrentUser.OpenSubKey(UninstallKey) is null;
             bool autostart;
             using (var r = Registry.CurrentUser.OpenSubKey(RunKey)) autostart = r?.GetValue("BHDisplay") is string;
-            CopyWithRetry(Environment.ProcessPath!, InstalledExe);
+            CopyWithRetry(ExePath, InstalledExe);
             // Start with Windows: on for a new install; on an update keep whatever the user chose.
             if (firstInstall || autostart)
                 using (var run = Registry.CurrentUser.CreateSubKey(RunKey)) run.SetValue("BHDisplay", $"\"{InstalledExe}\"");

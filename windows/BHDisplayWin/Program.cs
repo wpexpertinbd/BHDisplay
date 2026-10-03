@@ -12,12 +12,12 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
-        Log.Write($"start {Application.ProductVersion} on {Environment.OSVersion} from {Environment.ProcessPath}");
+        Log.Write($"start {Application.ProductVersion} on {Environment.OSVersion} from {Application.ExecutablePath}");
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => Fatal(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => Fatal(e.ExceptionObject as Exception);
 
-        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+        SetDpiAwareness();
         Application.EnableVisualStyles();
         if (args.Contains("--uninstall")) { Installer.Uninstall(); return; }
         // Started from a download: install (or update) into the user's Programs folder and run from there.
@@ -35,6 +35,15 @@ internal static class Program
         try { Application.Run(new TrayApp()); }
         catch (Exception e) { Fatal(e); }
         Log.Write("exit");
+    }
+
+    /// Per-monitor DPI awareness: hook coordinates and SetCursorPos are then real pixels on every monitor.
+    [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(nint value);
+    [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
+    private static void SetDpiAwareness()
+    {
+        try { if (SetProcessDpiAwarenessContext(-4)) return; } catch (EntryPointNotFoundException) { }   // PER_MONITOR_AWARE_V2
+        SetProcessDPIAware();
     }
 
     private static void Fatal(Exception? e)

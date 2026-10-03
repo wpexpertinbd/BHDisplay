@@ -1,6 +1,5 @@
 // Keyboard & mouse sharing — TCP session (handshake + encrypted frames), listener, and UDP discovery.
 // Events are raised on thread-pool threads; the app marshals them to its UI thread.
-using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -17,7 +16,7 @@ public sealed class ShareSession
     public Hello? Peer { get; private set; }
     public string PairCode { get; private set; } = "";
     public string RemoteHost { get; }
-    public byte[] PeerFingerprint => Peer is null ? [] : SHA256.HashData(Peer.IdentityKey);
+    public byte[] PeerFingerprint => Peer is null ? Array.Empty<byte>() : Bytes.Sha256(Peer.IdentityKey);
 
     public event Action<ShareSession>? Ready;
     public event Action<ShareSession, ShareMsg>? Message;
@@ -29,12 +28,12 @@ public sealed class ShareSession
     private readonly ECDiffieHellman _ephemeral = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
-    private byte[] _myHello = [];
-    private byte[] _transcript = [];
+    private byte[] _myHello = Array.Empty<byte>();
+    private byte[] _transcript = Array.Empty<byte>();
     private RecordCipher? _send, _recv;
     private bool _open;
     private int _closed;
-    private long _lastReceive = Environment.TickCount64;
+    private long _lastReceive = Num.NowMs;
     private Timer? _timer;
 
     private ShareSession(TcpClient client, Role role, ShareIdentity identity)
@@ -50,8 +49,9 @@ public sealed class ShareSession
     public static async Task<ShareSession> DialAsync(string host, int port, ShareIdentity id)
     {
         var c = new TcpClient { NoDelay = true };
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await c.ConnectAsync(host, port, cts.Token);
+        var connect = c.ConnectAsync(host, port);
+        if (await Task.WhenAny(connect, Task.Delay(5000)) != connect) { c.Close(); throw new TimeoutException("connection timed out"); }
+        await connect;                                         // rethrows a connection error
         return new ShareSession(c, Role.Dialer, id);
     }
 
@@ -88,7 +88,7 @@ public sealed class ShareSession
 
     private void Tick()
     {
-        var idle = Environment.TickCount64 - Interlocked.Read(ref _lastReceive);
+        var idle = Num.NowMs - Interlocked.Read(ref _lastReceive);
         if (_open) { if (idle > 6000) Close("peer stopped responding"); else Send(new ShareMsg.Ping()); }
         else if (idle > 5000) Close("handshake timed out");
     }
@@ -96,33 +96,43 @@ public sealed class ShareSession
     private async Task WriteFrameAsync(byte[] body)
     {
         var buf = new byte[4 + body.Length];
-        BinaryPrimitives.WriteUInt32BigEndian(buf, (uint)body.Length);
-        body.CopyTo(buf, 4);
-        await _stream.WriteAsync(buf, _cts.Token);
+        Bytes.PutU32(buf, 0, (uint)body.Length);
+        Buffer.BlockCopy(body, 0, buf, 4, body.Length);
+        await _stream.WriteAsync(buf, 0, buf.Length, _cts.Token);
+    }
+
+    private async Task ReadExactlyAsync(byte[] buf)
+    {
+        for (int got = 0; got < buf.Length;)
+        {
+            int n = await _stream.ReadAsync(buf, got, buf.Length - got, _cts.Token);
+            if (n == 0) throw new EndOfStreamException();
+            got += n;
+        }
     }
 
     private async Task<byte[]> ReadFrameAsync()
     {
         var head = new byte[4];
-        await _stream.ReadExactlyAsync(head, _cts.Token);
-        var n = BinaryPrimitives.ReadUInt32BigEndian(head);
+        await ReadExactlyAsync(head);
+        var n = Bytes.GetU32(head, 0);
         // Before authentication only small handshake frames are allowed (no large allocation for strangers).
         if (n < 1 || n > (_open ? Bhds.MaxFrame : 512)) throw new WireException("bad frame length");
         var body = new byte[n];
-        await _stream.ReadExactlyAsync(body, _cts.Token);
-        Interlocked.Exchange(ref _lastReceive, Environment.TickCount64);
+        await ReadExactlyAsync(body);
+        Interlocked.Exchange(ref _lastReceive, Num.NowMs);
         return body;
     }
 
     private byte[] MakeHello() => new Hello(_identity.DeviceId, _identity.PublicKey,
-        P256.Export(_ephemeral.ExportParameters(false)), RandomNumberGenerator.GetBytes(32), _identity.Name).Encode();
+        P256.Export(_ephemeral.ExportParameters(false)), Bytes.Random(32), _identity.Name).Encode();
 
     private async Task RunAsync()
     {
         try
         {
             // Listener commits to its HELLO first; the dialer sends its HELLO only after receiving that.
-            byte[] peerCommit = [];
+            byte[] peerCommit = Array.Empty<byte>();
             _myHello = MakeHello();
             if (Role == Role.Listener) await WriteFrameAsync(Handshake.Commitment(_myHello));
             else
@@ -134,8 +144,8 @@ public sealed class ShareSession
 
             var peerHello = await ReadFrameAsync();
             var h = Hello.Decode(peerHello);
-            if (h.DeviceId.AsSpan().SequenceEqual(_identity.DeviceId)) throw new WireException("connected to itself");
-            if (Role == Role.Dialer && !CryptographicOperations.FixedTimeEquals(Handshake.Commitment(peerHello), peerCommit))
+            if (Bytes.Equal(h.DeviceId, _identity.DeviceId)) throw new WireException("connected to itself");
+            if (Role == Role.Dialer && !Bytes.FixedTimeEquals(Handshake.Commitment(peerHello), peerCommit))
                 throw new WireException("peer's HELLO doesn't match its commitment");
             Peer = h;
             if (Role == Role.Listener) await WriteFrameAsync(_myHello);
@@ -160,7 +170,7 @@ public sealed class ShareSession
         }
         catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException) { Close("connection closed"); }
         catch (EndOfStreamException) { Close("peer closed"); }
-        catch (AuthenticationTagMismatchException) { Close("decryption failed"); }
+        catch (IOException) { Close(_closed != 0 ? "connection closed" : "peer closed"); }
         catch (Exception e) { Close(e.Message); }
     }
 }
@@ -201,8 +211,8 @@ public sealed class ShareDiscovery
 {
     private UdpClient? _udp;
     private Timer? _timer;
-    private byte[] _beacon = [];
-    private readonly Dictionary<string, long> _lastReply = [];
+    private byte[] _beacon = Array.Empty<byte>();
+    private readonly Dictionary<string, long> _lastReply = new();
     public event Action<Beacon>? Found;
 
     public void Start(ShareIdentity id, int tcpPort = Bhds.TcpPort)
@@ -212,9 +222,9 @@ public sealed class ShareDiscovery
         u.Client.Bind(new IPEndPoint(IPAddress.Any, Bhds.UdpPort));
         _udp = u;
         var w = new WireWriter();
-        w.Bytes(Bhds.BeaconMagic); w.Bytes(id.DeviceId); w.U16((ushort)tcpPort); w.Bytes(id.Fingerprint.AsSpan(0, 8));
-        var n = Encoding.UTF8.GetBytes(id.Name); if (n.Length > 64) n = n[..64];
-        w.U8((byte)n.Length); w.Bytes(n);
+        w.Bytes(Bhds.BeaconMagic); w.Bytes(id.DeviceId); w.U16((ushort)tcpPort); w.Bytes(id.Fingerprint, 8);
+        var n = Encoding.UTF8.GetBytes(id.Name); int nl = Math.Min(n.Length, 64);
+        w.U8((byte)nl); w.Bytes(n, nl);
         _beacon = w.ToArray();
         _timer = new Timer(_ => { foreach (var t in BroadcastTargets()) Send(t); }, null, 0, 2000);
         _ = Task.Run(async () =>
@@ -227,7 +237,7 @@ public sealed class ShareDiscovery
                     var r = await c.ReceiveAsync();
                     // A flood of (spoofed) beacons must not reach the UI thread, where the input hooks run:
                     // a real peer sends one every 2 s, so 20 a second overall is generous.
-                    var now = Environment.TickCount64;
+                    var now = Num.NowMs;
                     if (now - windowStart >= 1000) { windowStart = now; windowCount = 0; }
                     if (++windowCount > 20) continue;
                     if (TryParse(r.Buffer, r.RemoteEndPoint.Address.ToString(), id.DeviceId) is { } b)
@@ -251,7 +261,7 @@ public sealed class ShareDiscovery
     /// only get through in one direction.
     private void Reply(IPAddress host)
     {
-        var key = host.ToString(); var now = Environment.TickCount64;
+        var key = host.ToString(); var now = Num.NowMs;
         lock (_lastReply)
         {
             if (_lastReply.Count > 256) _lastReply.Clear();         // bounded: senders can be spoofed
@@ -292,9 +302,9 @@ public sealed class ShareDiscovery
         {
             var r = new WireReader(buf);
             if (!r.Bytes(5).SequenceEqual(Bhds.BeaconMagic)) return null;
-            var id = r.Bytes(16).ToArray();
-            if (id.AsSpan().SequenceEqual(ownId)) return null;
-            var port = r.U16(); var fp = r.Bytes(8).ToArray();
+            var id = r.Bytes(16);
+            if (Bytes.Equal(id, ownId)) return null;
+            var port = r.U16(); var fp = r.Bytes(8);
             int nl = r.U8(); if (nl > 64) return null;
             return new Beacon(id, host, port, fp, Bhds.CleanName(Encoding.UTF8.GetString(r.Bytes(nl))));
         }

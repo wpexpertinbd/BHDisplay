@@ -3,15 +3,15 @@ using System.Runtime.InteropServices;
 
 namespace BHDisplay.Win;
 
-internal static partial class Native
+internal static class Native
 {
     // ---- hooks ----
     public const int WH_KEYBOARD_LL = 13, WH_MOUSE_LL = 14;
     public delegate nint HookProc(int nCode, nint wParam, nint lParam);
-    [LibraryImport("user32.dll", SetLastError = true)] public static partial nint SetWindowsHookExW(int idHook, HookProc lpfn, nint hMod, uint threadId);
-    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool UnhookWindowsHookEx(nint hhk);
-    [LibraryImport("user32.dll")] public static partial nint CallNextHookEx(nint hhk, int nCode, nint wParam, nint lParam);
-    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf16)] public static partial nint GetModuleHandleW(string? name);
+    [DllImport("user32.dll", SetLastError = true)] public static extern nint SetWindowsHookExW(int idHook, HookProc lpfn, nint hMod, uint threadId);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool UnhookWindowsHookEx(nint hhk);
+    [DllImport("user32.dll")] public static extern nint CallNextHookEx(nint hhk, int nCode, nint wParam, nint lParam);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern nint GetModuleHandleW(string? name);
 
     public const int WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_SYSKEYDOWN = 0x104, WM_SYSKEYUP = 0x105;
     public const int WM_MOUSEMOVE = 0x200, WM_LBUTTONDOWN = 0x201, WM_LBUTTONUP = 0x202, WM_RBUTTONDOWN = 0x204, WM_RBUTTONUP = 0x205,
@@ -36,11 +36,11 @@ internal static partial class Native
     [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public nuint dwExtraInfo; }
     [StructLayout(LayoutKind.Explicit)] public struct InputUnion { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
     [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public InputUnion u; }
-    [LibraryImport("user32.dll", SetLastError = true)] public static partial uint SendInput(uint n, [In] INPUT[] inputs, int size);
+    [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, [In] INPUT[] inputs, int size);
 
-    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool GetCursorPos(out POINT p);
-    [LibraryImport("user32.dll")] public static partial short GetAsyncKeyState(int vKey);
-    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool SetCursorPos(int x, int y);
 
     // ---- monitors ----
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -54,10 +54,10 @@ internal static partial class Native
     public const int WM_HOTKEY = 0x312;
     public const int WM_WTSSESSION_CHANGE = 0x2B1;
     public const int WTS_CONSOLE_DISCONNECT = 2, WTS_REMOTE_DISCONNECT = 4, WTS_SESSION_LOCK = 7, WTS_SESSION_UNLOCK = 8;
-    [LibraryImport("wtsapi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool WTSRegisterSessionNotification(nint hWnd, uint dwFlags);
-    [LibraryImport("wtsapi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool WTSUnRegisterSessionNotification(nint hWnd);
-    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool RegisterHotKey(nint hWnd, int id, uint mods, uint vk);
-    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool UnregisterHotKey(nint hWnd, int id);
+    [DllImport("wtsapi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool WTSRegisterSessionNotification(nint hWnd, uint dwFlags);
+    [DllImport("wtsapi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool WTSUnRegisterSessionNotification(nint hWnd);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool RegisterHotKey(nint hWnd, int id, uint mods, uint vk);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool UnregisterHotKey(nint hWnd, int id);
 
     // ---- DDC/CI (dxva2) ----
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]

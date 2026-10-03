@@ -1,5 +1,7 @@
 // USB HID usage IDs (Keyboard/Keypad page 0x07) ↔ PC scan codes (set 1; 0xE0xx = extended).
 // Source: USB HID Usage Tables and Microsoft's "Keyboard Scan Code Specification".
+using BHDisplay.Core;
+
 namespace BHDisplay.Win;
 
 internal static class KeyMap
@@ -89,7 +91,7 @@ internal static class Screens
     public static Native.POINT EntryPoint(int edge, float pos)
     {
         var r = OnEdge(edge).OrderByDescending(m => (long)(m.Right - m.Left) * (m.Bottom - m.Top)).FirstOrDefault();
-        var y = r.Top + (int)(Math.Clamp(pos, 0, 1) * (r.Bottom - r.Top - 1));
+        var y = r.Top + (int)(Num.Clamp(pos, 0, 1) * (r.Bottom - r.Top - 1));
         // Land well inside, so a 1-pixel wobble can't send the pointer straight back (no flapping).
         return new Native.POINT { X = edge == 0 ? r.Left + 24 : r.Right - 25, Y = y };
     }
@@ -107,7 +109,7 @@ internal static class Screens
         Native.POINT best = p; double bestD = double.MaxValue;
         foreach (var r in ms)
         {
-            var q = new Native.POINT { X = Math.Clamp(p.X, r.Left, r.Right - 1), Y = Math.Clamp(p.Y, r.Top, r.Bottom - 1) };
+            var q = new Native.POINT { X = Num.Clamp(p.X, r.Left, r.Right - 1), Y = Num.Clamp(p.Y, r.Top, r.Bottom - 1) };
             var d = Math.Pow(q.X - p.X, 2) + Math.Pow(q.Y - p.Y, 2);
             if (d < bestD) { best = q; bestD = d; }
         }

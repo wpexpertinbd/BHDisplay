@@ -11,3 +11,7 @@ windows/BHDisplayWin/bin/
 windows/BHDisplayWin/obj/
 tests/interop/csharp/bin/
 tests/interop/csharp/obj/
+tests/gcm/bin/
+tests/gcm/obj/
+tests/interop/csharp/bin/
+tests/interop/csharp/obj/

@@ -1,10 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- BHDisplay for Windows: tray app (WinForms). Builds on macOS too:
-       dotnet publish -c Release -r win-x64  → single self-contained BHDisplay.exe -->
+  <!-- BHDisplay for Windows: tray app (WinForms) on .NET Framework 4.8, which is part of Windows 10 and 11 —
+       so the exe needs no runtime of its own and stays well under 1 MB. Builds on macOS too:
+       dotnet publish -c Release -o ../dist  → BHDisplay.exe -->
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
-    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -16,11 +17,16 @@
     <Product>BHDisplay</Product>
     <Company>BiswasHost</Company>
     <Copyright>© 2026 BiswasHost</Copyright>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>true</SelfContained>
-    <PublishSingleFile>true</PublishSingleFile>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DebugType>none</DebugType>
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
   </PropertyGroup>
+  <ItemGroup>
+    <Using Remove="System.Net.Http" />
+    <Reference Include="System.Web.Extensions" />
+    <!-- Reference assemblies so it builds without Windows; nothing from this package ships. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
 </Project>
