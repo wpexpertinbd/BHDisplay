@@ -49,10 +49,18 @@ public sealed class ShareSession
     public static async Task<ShareSession> DialAsync(string host, int port, ShareIdentity id)
     {
         var c = new TcpClient { NoDelay = true };
-        var connect = c.ConnectAsync(host, port);
-        if (await Task.WhenAny(connect, Task.Delay(5000)) != connect) { c.Close(); throw new TimeoutException("connection timed out"); }
-        await connect;                                         // rethrows a connection error
-        return new ShareSession(c, Role.Dialer, id);
+        try
+        {
+            var connect = c.ConnectAsync(host, port);
+            if (await Task.WhenAny(connect, Task.Delay(5000)) != connect)
+            {
+                _ = connect.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                throw new TimeoutException("connection timed out");
+            }
+            await connect;                                     // rethrows a connection error
+            return new ShareSession(c, Role.Dialer, id);
+        }
+        catch { c.Close(); throw; }
     }
 
     public void Start()
@@ -164,6 +172,7 @@ public sealed class ShareSession
             while (_closed == 0)
             {
                 var msg = ShareMsg.Decode(_recv.Open(await ReadFrameAsync()));
+                if (_closed != 0) break;                        // never deliver after Closed
                 if (msg is ShareMsg.Ping) Send(new ShareMsg.Pong());
                 Message?.Invoke(this, msg);
             }

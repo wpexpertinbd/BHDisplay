@@ -20,6 +20,14 @@ internal static class Program
         SetDpiAwareness();
         Application.EnableVisualStyles();
         if (args.Contains("--uninstall")) { Installer.Uninstall(); return; }
+        if (args.Contains("--selftest"))
+        {
+            var (ok, report) = BHDisplay.Core.SelfTest.Run();
+            Log.Write("selftest " + (ok ? "passed" : "FAILED") + Environment.NewLine + report);
+            MessageBox.Show((ok ? "All checks passed.\n\n" : "Some checks FAILED.\n\n") + report, "BHDisplay self-test",
+                MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+            return;
+        }
         // Started from a download: install (or update) into the user's Programs folder and run from there.
         if (!Installer.IsInstalledCopy && !args.Contains("--portable")) { Installer.Install(); return; }
 

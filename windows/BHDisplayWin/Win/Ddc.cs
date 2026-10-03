@@ -85,7 +85,14 @@ internal sealed class Settings
                 && a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToDictionary(kv => kv.Key, kv => kv.Value);
             return s;
         }
-        catch { return new(); }
+        catch (FileNotFoundException) { return new(); }
+        catch (DirectoryNotFoundException) { return new(); }
+        catch (Exception e)
+        {   // Unreadable: keep the old file (it holds the pairing) instead of overwriting it with defaults.
+            try { File.Copy(FilePath, FilePath + ".bad-" + DateTime.Now.ToString("yyyyMMdd-HHmmss"), true); } catch { }
+            Log.Write("settings.json couldn't be read (" + e.Message + "); a copy was kept as settings.json.bad-*");
+            return new();
+        }
     }
 
     public void Save()
@@ -105,7 +112,10 @@ internal sealed class Settings
     public static void SaveIdentity(byte[] blob)
     {
         Directory.CreateDirectory(Dir);
-        File.WriteAllBytes(Path.Combine(Dir, "identity"), Dpapi.Protect(blob));
+        var path = Path.Combine(Dir, "identity");
+        // Never destroy an existing identity (it is what the Mac knows this PC by): keep a copy first.
+        if (File.Exists(path)) File.Copy(path, path + ".bak-" + DateTime.Now.ToString("yyyyMMdd-HHmmss"), true);
+        File.WriteAllBytes(path, Dpapi.Protect(blob));
     }
 }
 

@@ -6,6 +6,9 @@ PC, console…) from the macOS menu bar, and control brightness, contrast,
 sharpness, blue light filter, volume, View Mode and colour temperature —
 without touching the monitor's buttons. 100% free & open-source.
 
+New: keyboard & mouse sharing with BHDisplay for Windows (free, on the same
+Releases page) — use either computer's keyboard and mouse on both.
+
 
 INSTALL
 -------

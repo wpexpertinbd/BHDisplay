@@ -227,7 +227,7 @@ internal sealed class TrayApp : ApplicationContext
         try
         {
             Log.Write("sharing: loading identity");
-            _id = ShareIdentity.LoadOrCreate(Settings.LoadIdentity, Settings.SaveIdentity, Environment.MachineName);
+            _id = ShareIdentity.LoadOrCreate(Settings.LoadIdentity, Settings.SaveIdentity, Environment.MachineName, Log.Write);
             Log.Write($"sharing: identity ok ({_id.Name}); installing input hooks");
             if (!_capture.Start()) { _status = "Can't capture input (hooks failed)"; Log.Write(_status); return; }
             Log.Write("sharing: hooks ok; listening on TCP " + Bhds.TcpPort);

@@ -20,7 +20,7 @@ internal static class Installer
     private static string Shortcut => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "BHDisplay.lnk");
 
     /// This program's own path (Environment.ProcessPath does not exist on .NET Framework).
-    public static string ExePath => Application.ExecutablePath;
+    public static string ExePath => Process.GetCurrentProcess().MainModule!.FileName;
 
     public static bool IsInstalledCopy =>
         string.Equals(Path.GetFullPath(ExePath), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase);

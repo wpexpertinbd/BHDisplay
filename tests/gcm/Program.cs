@@ -82,5 +82,12 @@ byte[] H(string s) => Convert.FromHexString(s);
 // --- Hex helpers.
 Check(Bytes.Hex(H("00ff10ab")) == "00ff10ab" && Bytes.FromHex("00FF10ab")!.AsSpan().SequenceEqual(H("00ff10ab")) && Bytes.FromHex("0g") is null, "hex round trip");
 
+// --- The self-test the Windows app runs with --selftest, here on this platform.
+{
+    var (ok, report) = SelfTest.Run();
+    Console.Write(report);
+    Check(ok, "SelfTest.Run() passes");
+}
+
 Console.WriteLine(fails == 0 ? "ALL PASSED" : $"{fails} FAILED");
 return fails == 0 ? 0 : 1;

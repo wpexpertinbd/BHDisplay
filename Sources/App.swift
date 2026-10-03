@@ -207,7 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { MonitorModel.shared.refresh() }
         }, nil)
         if CommandLine.arguments.contains("-DocsOpenMenu") {   // docs only: pop the menu for a screenshot
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.status.button?.performClick(nil) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) { self.status.button?.performClick(nil) }   // after sharing reconnects
             return
         }
         if !launchedAsLoginItem() { showWindow() }

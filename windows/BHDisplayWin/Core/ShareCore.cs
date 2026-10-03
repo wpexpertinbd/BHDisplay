@@ -98,7 +98,7 @@ public sealed class ShareIdentity
     }
 
     /// Blob = device id (16) || private scalar D (32) || public X (32) || Y (32). Only this platform reads it.
-    public static ShareIdentity LoadOrCreate(Func<byte[]?> load, Action<byte[]> save, string name)
+    public static ShareIdentity LoadOrCreate(Func<byte[]?> load, Action<byte[]> save, string name, Action<string>? log = null)
     {
         var blob = load();
         if (blob is { Length: 112 })
@@ -112,13 +112,25 @@ public sealed class ShareIdentity
                 });
                 return new ShareIdentity(Bytes.Slice(blob, 0, 16), key, name);
             }
-            catch (CryptographicException) { /* corrupt → recreate */ }
+            catch (CryptographicException e) { log?.Invoke("saved identity couldn't be read (" + e.Message + "); creating a new one"); }
         }
-        var k = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var k = NewSigningKey();
         var id = Bytes.Random(16);
         var p = k.ExportParameters(true);
         save(Bytes.Concat(id, p.D!, p.Q.X!, p.Q.Y!));
         return new ShareIdentity(id, k, name);
+    }
+
+    /// A new P-256 key whose private part can be exported once to be saved. On .NET Framework (Windows CNG) a key
+    /// must be created with the plaintext-export policy for that; modern .NET's ECDsa.Create already allows it.
+    private static ECDsa NewSigningKey()
+    {
+#if NETFRAMEWORK
+        var p = new CngKeyCreationParameters { ExportPolicy = CngExportPolicies.AllowPlaintextExport, KeyUsage = CngKeyUsages.Signing };
+        return new ECDsaCng(CngKey.Create(CngAlgorithm.ECDsaP256, null, p));
+#else
+        return ECDsa.Create(ECCurve.NamedCurves.nistP256);
+#endif
     }
 
     public static ShareIdentity Ephemeral(string name) =>
