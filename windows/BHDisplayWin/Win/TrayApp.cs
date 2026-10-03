@@ -167,6 +167,16 @@ internal sealed class TrayApp : ApplicationContext
 
     public static TrayApp? Current { get; private set; }
 
+    /// The Mac's keyboard/mouse is in use here: make sure the display is on (and stays on), like real input would.
+    private long _lastActive;
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern uint SetThreadExecutionState(uint flags);
+    private void UserIsActive()
+    {
+        if (Num.NowMs - _lastActive < 2000) return;
+        _lastActive = Num.NowMs;
+        SetThreadExecutionState(0x00000002 | 0x00000001);   // ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED (one-shot reset)
+    }
+
     /// Before a crash dialog: stop swallowing this PC's input and release keys pressed for the Mac,
     /// or nothing could click the dialog's OK.
     public static void EmergencyRelease()
@@ -453,10 +463,10 @@ internal sealed class TrayApp : ApplicationContext
             case ShareMsg.MonitorShows ms when Ddc.IsInput(ms.Code):
                 Log.Write($"the Mac says the monitor shows {Ddc.NameOf(ms.Code)}");
                 MonitorNowShows(ms.Code); break;
-            case ShareMsg.Move mv: if (_controlled) _emu.Move(mv.Dx, mv.Dy); break;
+            case ShareMsg.Move mv: if (_controlled) { UserIsActive(); _emu.Move(mv.Dx, mv.Dy); } break;
             case ShareMsg.Button b: if (_controlled) _emu.Button(b.Number, b.Down); break;
             case ShareMsg.Scroll sc: if (_controlled) _emu.Scroll(sc.Dx, sc.Dy); break;
-            case ShareMsg.Key k: if (_controlled) _emu.Key(k.Usage, k.Down); break;
+            case ShareMsg.Key k: if (_controlled) { UserIsActive(); _emu.Key(k.Usage, k.Down); } break;
             case ShareMsg.ReleaseAll: _emu.ReleaseAll(); break;
             case ShareMsg.Clipboard c: ApplyClipboard(c.Text); break;
             case ShareMsg.MonitorPorts p when Ddc.IsInput(p.Mac) && Ddc.IsInput(p.Other) && p.Mac != p.Other:

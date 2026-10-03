@@ -1,5 +1,6 @@
 import AppKit
 import Carbon
+import IOKit.pwr_mgt
 import Combine
 import CryptoKit
 
@@ -464,6 +465,10 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             return
         }
         switch m {
+        case .enter, .move, .button, .scroll, .key: if m.isEnter || controlled { userIsActive() }
+        default: break
+        }
+        switch m {
         case .enter(let edge, let pos):
             if controlling { capture.end(warpTo: nil); controlling = false }
             // Shows the peer: its pointer comes off the shared monitor onto our screens. Shows this Mac: it comes
@@ -499,6 +504,17 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         default: break
         }
         updateStatus()
+    }
+
+    /// Input typed in by BHDisplay doesn't count as "someone is here" for macOS, so a sleeping display stays dark
+    /// while the other computer's mouse moves on it. Declaring user activity (Apple's API for exactly this) wakes the
+    /// display and keeps it awake while that keyboard/mouse is in use. At most every 2 s.
+    private var userActivityID: IOPMAssertionID = 0
+    private var lastUserActivity = Date.distantPast
+    private func userIsActive() {
+        guard Date().timeIntervalSince(lastUserActivity) > 2 else { return }
+        lastUserActivity = Date()
+        IOPMAssertionDeclareUserActivity("BHDisplay: keyboard/mouse of the paired computer" as CFString, kIOPMUserActiveLocal, &userActivityID)
     }
 
     private func peerPointerLeft(position: Float) {

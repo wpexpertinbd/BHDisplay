@@ -325,3 +325,7 @@ enum ShareMsg: Equatable {
         }
     }
 }
+
+extension ShareMsg {
+    var isEnter: Bool { if case .enter = self { return true } else { return false } }
+}
