@@ -22,6 +22,9 @@ internal sealed class Capture : IDisposable
     private readonly HookProc _kbProc, _msProc;            // keep delegates alive
     private POINT _park, _last;
     private bool _ctrl, _alt, _win;
+    // Keys physically held on this PC when capturing began (e.g. Ctrl+Alt+Win of the switch shortcut):
+    // their releases must reach Windows, or Windows keeps them "pressed" for good.
+    private readonly HashSet<uint> _heldHere = [];
 
     public Capture() { _kbProc = KeyboardProc; _msProc = MouseProc; }
 
@@ -41,6 +44,7 @@ internal sealed class Capture : IDisposable
         _park = Screens.Center(Edge);                      // away from edges so deltas never clamp
         SetCursorPos(_park.X, _park.Y);
         _ctrl = _alt = _win = false;
+        _heldHere.RemoveWhere(vk => (GetAsyncKeyState((int)vk) & 0x8000) == 0);   // drop any missed release
     }
 
     public void End(float? position)
@@ -50,7 +54,7 @@ internal sealed class Capture : IDisposable
         if (position is { } p)
         {
             var e = Screens.EntryPoint(Edge, p);
-            SetCursorPos(Edge == 0 ? e.X + 4 : e.X - 4, e.Y);
+            SetCursorPos(e.X, e.Y);
         }
     }
 
@@ -97,10 +101,17 @@ internal sealed class Capture : IDisposable
 
     private nint KeyboardProc(int nCode, nint wParam, nint lParam)
     {
-        if (nCode < 0 || !Capturing) return CallNextHookEx(_kb, nCode, wParam, lParam);
+        if (nCode < 0) return CallNextHookEx(_kb, nCode, wParam, lParam);
         var k = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
         if (k.dwExtraInfo == Tag.Injected) return CallNextHookEx(_kb, nCode, wParam, lParam);
         bool down = (int)wParam is WM_KEYDOWN or WM_SYSKEYDOWN;
+        if (!Capturing)
+        {
+            if (down) _heldHere.Add(k.vkCode); else _heldHere.Remove(k.vkCode);
+            return CallNextHookEx(_kb, nCode, wParam, lParam);
+        }
+        if (!down && _heldHere.Remove(k.vkCode)) return CallNextHookEx(_kb, nCode, wParam, lParam);   // pressed here: release here
+        if (down && _heldHere.Contains(k.vkCode)) return 1;                                         // its auto-repeat: drop
         var hid = KeyMap.ToHid(k.vkCode, k.scanCode, (k.flags & LLKHF_EXTENDED) != 0);
         switch (hid)
         {

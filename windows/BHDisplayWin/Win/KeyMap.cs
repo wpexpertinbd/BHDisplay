@@ -89,7 +89,8 @@ internal static class Screens
     {
         var r = OnEdge(edge).OrderByDescending(m => (long)(m.Right - m.Left) * (m.Bottom - m.Top)).FirstOrDefault();
         var y = r.Top + (int)(Math.Clamp(pos, 0, 1) * (r.Bottom - r.Top - 1));
-        return new Native.POINT { X = edge == 0 ? r.Left + 2 : r.Right - 3, Y = y };
+        // Land well inside, so a 1-pixel wobble can't send the pointer straight back (no flapping).
+        return new Native.POINT { X = edge == 0 ? r.Left + 24 : r.Right - 25, Y = y };
     }
 
     public static Native.POINT Center(int edge)

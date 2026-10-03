@@ -44,6 +44,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     private var displayWatch: AnyCancellable?
     private var showsPeer = false                    // the shared monitor currently shows the peer
     private var suppressUntil = Date.distantPast     // after ⌃⌥⌘Esc: don't re-capture for a moment
+    private var lastHandover = Date.distantPast       // no bouncing straight back across the boundary
 
     private override init() {
         let d = UserDefaults.standard
@@ -148,20 +149,31 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         return ShareLayout(shared: shared, others: others, sharedOnRight: lastSharedOnRight)
     }
 
+    /// While the shared monitor shows this Mac, the other computer sits beyond the outer edge of our desktop on
+    /// the shared monitor's side: its pointer enters there and leaves back through it.
+    private func outerLayout() -> ShareLayout {
+        _ = layout()                                               // refreshes lastSharedOnRight
+        return ShareLayout(shared: nil, others: ShareScreens.displays(), sharedOnRight: lastSharedOnRight)
+    }
+
     /// Re-derive the mode from what the shared monitor shows; `announce` tells the peer about a change.
     private func monitorInputChanged(announce: Bool) {
         let m = MonitorModel.shared
         guard running, let input = m.input, MonitorInput.isValid(input), let mac = m.macInput else { return }
         let nowShowsPeer = input != mac
         if announce { session?.send(.monitorShows(UInt8(truncatingIfNeeded: input))) }
-        if nowShowsPeer != showsPeer {
+        let changed = nowShowsPeer != showsPeer
+        if changed {
             showsPeer = nowShowsPeer
             ShareLog.write("monitor shows \(nowShowsPeer ? "the other computer" : "this Mac") (\(MonitorInput.name(for: input)))")
         }
-        applyMode()
+        applyMode(modeChanged: changed)
     }
 
-    private func applyMode() {
+    /// `modeChanged`: the monitor just changed between the two computers. Only then is a peer that is
+    /// controlling this Mac sent back — re-applying the same mode (display turned off, screens rearranged)
+    /// must not drop a pointer that crossed over on purpose.
+    private func applyMode(modeChanged: Bool = false) {
         let lay = layout()
         guard showsPeer, let lay else {
             // Shared monitor shows this Mac: keep our input; stop forwarding if we were.
@@ -170,15 +182,21 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             updateStatus(); return
         }
         // Shared monitor shows the peer.
-        if controlled { emulator.leave(); controlled = false }       // the peer is visible now; it keeps its input
+        if controlled && modeChanged {                              // the screen layout changed under the peer's pointer
+            emulator.leave(); controlled = false
+            session?.send(.leave(edge: 4, position: 0.5))           // tell it, or it keeps swallowing its own keyboard/mouse
+            ShareLog.write("monitor changed: \(connectedName ?? "peer") gets its keyboard/mouse back")
+        }
         if lay.others.isEmpty {
-            capture.watch = nil                                     // no screen of our own: everything goes to the peer
-            if !controlling { startControlling(position: 0.5, takeover: true, layout: lay) }
+            capture.watch = nil                                     // lid closed: no screen of our own to cross from
         } else {
             capture.watch = lay
-            // If our pointer is already on the shared monitor, the user is "on" the peer now.
-            if !controlling, let p = CGEvent(source: nil)?.location, let s = lay.shared, s.contains(p) {
-                startControlling(position: lay.position(p), takeover: false, layout: lay)
+            // Our pointer was left on the shared monitor, which now shows the peer: bring it onto our own screen
+            // instead of handing the peer our keyboard/mouse — the Mac only gives them away when the user
+            // deliberately moves the pointer across.
+            if !controlling, modeChanged, let p = CGEvent(source: nil)?.location, let s = lay.shared, s.contains(p) {
+                let own = lay.others.reduce(CGRect.null) { $0.union($1) }
+                CGWarpMouseCursorPosition(CGPoint(x: own.midX, y: own.midY))
             }
         }
         updateStatus()
@@ -357,18 +375,24 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     private func received(_ m: ShareMsg, from s: ShareSession) {
         if m == .pairConfirm, pairing?.session === s { pairing?.remote = true; finishPairingIfBoth(); return }
         if m == .pairReject, pairing?.session === s { s.close("pairing declined on the other computer"); return }
-        guard s === session else { return }
+        guard s === session else {
+            if case .ping = m {} else if case .pong = m {} else { ShareLog.write("ignored a message from a connection that is not the active one") }
+            return
+        }
         switch m {
         case .enter(let edge, let pos):
             if controlling { capture.end(warpTo: nil); controlling = false }
-            // Take-over (edge 4), or the shared monitor shows this Mac: the pointer stays where it is.
-            emulator.enter(position: pos, layout: edge == 4 || !showsPeer ? nil : layout())
+            // Shows the peer: its pointer comes off the shared monitor onto our screens. Shows this Mac: it comes
+            // in at the outer edge on the shared monitor's side. (Edge 4 = old take-over: pointer stays put.)
+            emulator.enter(position: pos, layout: edge == 4 ? nil : showsPeer ? layout() : outerLayout())
             controlled = true
+            lastHandover = Date()
             ShareLog.write("← \(connectedName ?? "peer") is controlling this Mac (\(edge == 4 ? "take-over" : "came across"))")
         case .leave(_, let pos):
             if controlling {
                 capture.end(warpTo: showsPeer ? layout()?.besideShared(pos) : nil)
                 controlling = false
+                lastHandover = Date()
                 ShareLog.write("← back on this Mac")
             } else if controlled {
                 emulator.leave(); controlled = false
@@ -384,6 +408,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             // The other computer asks us to switch (we may need to turn our output back on first).
             if MonitorInput.isValid(UInt16(code)) { ShareLog.write("switch requested by peer: \(MonitorInput.name(for: UInt16(code)))"); MonitorModel.shared.switchTo(UInt16(code)) }
         case .monitorShows(let code):
+            ShareLog.write("peer says the monitor shows \(MonitorInput.name(for: UInt16(code)))")
             if MonitorInput.isValid(UInt16(code)), MonitorModel.shared.input != UInt16(code) {
                 MonitorModel.shared.adoptInput(UInt16(code))       // the peer switched it
             }
@@ -393,9 +418,12 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     }
 
     private func peerPointerLeft(position: Float) {
-        guard controlled, let s = session, let lay = layout() else { return }
+        // No time guard here: the emulator has already let go, so the peer MUST be told, or it keeps sending into nothing.
+        guard controlled, let s = session else { return }
+        let lay = showsPeer ? (layout() ?? outerLayout()) : outerLayout()
         controlled = false
-        ShareLog.write("→ pointer moved onto the shared monitor: back to \(connectedName ?? "peer")")
+        lastHandover = Date()
+        ShareLog.write("→ \(connectedName ?? "peer")'s pointer went back to it")
         if let text = clipboard.takeOutgoing() { s.send(.clipboard(text)) }
         s.send(.leave(edge: lay.sharedOnRight ? 1 : 0, position: position))
         updateStatus()
@@ -412,7 +440,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
 
     nonisolated func captureEnteredShared(position: Float) -> Bool {
         MainActor.assumeIsolated {
-            guard showsPeer, !controlled, let lay = layout() else { return false }
+            guard showsPeer, Date().timeIntervalSince(lastHandover) > 0.25, let lay = layout() else { return false }
+            lastHandover = Date()
+            if controlled { emulator.leave(); controlled = false }   // our own mouse wins: the peer's pointer was here
             return startControlling(position: position, takeover: false, layout: lay)
         }
     }

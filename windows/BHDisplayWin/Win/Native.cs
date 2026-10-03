@@ -39,6 +39,7 @@ internal static partial class Native
     [LibraryImport("user32.dll", SetLastError = true)] public static partial uint SendInput(uint n, [In] INPUT[] inputs, int size);
 
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool GetCursorPos(out POINT p);
+    [LibraryImport("user32.dll")] public static partial short GetAsyncKeyState(int vKey);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool SetCursorPos(int x, int y);
 
     // ---- monitors ----

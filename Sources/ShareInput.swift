@@ -81,6 +81,7 @@ struct ShareLayout {
     let shared: CGRect?
     let others: [CGRect]        // this Mac's other displays (e.g. the MacBook screen); may be empty
     let sharedOnRight: Bool
+    static let inset: CGFloat = 24
     private var own: CGRect { others.reduce(CGRect.null) { $0.union($1) } }
 
     /// The display a vertical position refers to: the shared monitor, or our display at the facing edge.
@@ -107,8 +108,9 @@ struct ShareLayout {
         let r = reference
         let y = r.minY + CGFloat(min(max(position, 0), 1)) * (r.height - 1)
         let x: CGFloat
-        if let s = shared { x = sharedOnRight ? s.minX - 3 : s.maxX + 2 }
-        else { x = sharedOnRight ? own.maxX - 4 : own.minX + 3 }
+        // Land well inside, so a 1-pixel wobble can't send the pointer straight back (no flapping).
+        if let s = shared { x = sharedOnRight ? s.minX - ShareLayout.inset : s.maxX + ShareLayout.inset }
+        else { x = sharedOnRight ? own.maxX - ShareLayout.inset : own.minX + ShareLayout.inset }
         return ShareScreens.clamp(CGPoint(x: x, y: y), within: others.isEmpty ? shared.map { [$0] } : others)
     }
 }
@@ -168,10 +170,12 @@ final class ShareCapture {
     }
 
     /// Start forwarding everything. `parkAt`: where to hold this Mac's (hidden) pointer meanwhile.
+    private var heldHere: UInt64 = 0            // device modifier bits held when forwarding began
     func begin(parkAt: CGPoint?) {
         guard !capturing else { return }
         capturing = true
         lastFlags = CGEventSource.flagsState(.combinedSessionState).rawValue
+        heldHere = lastFlags & ShareKeyMap.modifierBits.reduce(0) { $0 | ($1.1 & 0xFFFF) }
         scrollRemainder = (0, 0)
         if let p = parkAt { CGWarpMouseCursorPosition(p) }
         CGAssociateMouseAndMouseCursorPosition(0)      // pointer stays put; deltas keep coming
@@ -229,9 +233,18 @@ final class ShareCapture {
         case .flagsChanged:
             let now = event.flags.rawValue, changed = now ^ lastFlags
             lastFlags = now
+            // Modifiers already held on this Mac when forwarding began (e.g. ⌃⌥⌘ of a shortcut): their release
+            // belongs to this Mac — the peer never saw them pressed, and macOS would keep them "down" otherwise.
+            let releasedHere = changed & heldHere & ~now
+            if releasedHere != 0 {
+                heldHere &= ~releasedHere
+                if changed & ~releasedHere & ShareKeyMap.modifierBits.reduce(0, { $0 | ($1.1 & 0xFFFF) }) == 0 {
+                    return Unmanaged.passUnretained(event)
+                }
+            }
             for (usage, bits) in ShareKeyMap.modifierBits {
                 let device = bits & 0xFFFF
-                if changed & device != 0 {
+                if changed & device != 0, releasedHere & device == 0 {
                     let u = swapCmdCtrl ? ShareKeyMap.swapCmdCtrl(usage) : usage
                     delegate?.captured(.key(usage: u, down: now & device != 0))
                 }

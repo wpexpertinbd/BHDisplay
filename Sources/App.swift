@@ -187,7 +187,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var hotKeys: [EventHotKeyRef?] = []
     private let m = MonitorModel.shared
 
+    func applicationWillTerminate(_ n: Notification) {
+        DisplayPower.turnOn()                     // never leave the shared monitor without the Mac's signal
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
+        DisplayPower.restoreLeftover()          // our display-off never outlives a quit or crash
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "BHDisplay")
         let menu = NSMenu(); menu.delegate = self; status.menu = menu

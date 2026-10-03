@@ -5,23 +5,27 @@ namespace BHDisplay.Win;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
-        Log.Write($"start {Application.ProductVersion} on {Environment.OSVersion}");
+        Log.Write($"start {Application.ProductVersion} on {Environment.OSVersion} from {Environment.ProcessPath}");
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => Fatal(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => Fatal(e.ExceptionObject as Exception);
 
-        using var single = new Mutex(true, @"Local\BHDisplay.Win", out bool first);
+        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+        Application.EnableVisualStyles();
+        if (args.Contains("--uninstall")) { Installer.Uninstall(); return; }
+        // Started from a download: install (or update) into the user's Programs folder and run from there.
+        if (!Installer.IsInstalledCopy && !args.Contains("--portable")) { Installer.Install(); return; }
+
+        using var single = new Mutex(true, Installer.MutexName, out bool first);
         if (!first)
         {
             MessageBox.Show("BHDisplay is already running.\n\nLook for its icon in the system tray — click the ^ arrow next to the clock if you don't see it.",
                 "BHDisplay", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        // Per-monitor DPI awareness: hook coordinates and SetCursorPos are then in real pixels on every monitor.
-        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
-        Application.EnableVisualStyles();
+        // (Per-monitor DPI awareness set above: hook coordinates and SetCursorPos are real pixels on every monitor.)
         Application.SetCompatibleTextRenderingDefault(false);
         try { Application.Run(new TrayApp()); }
         catch (Exception e) { Fatal(e); }

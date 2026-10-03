@@ -104,11 +104,22 @@ frame. A frame that fails to decrypt closes the connection. Plaintext = `type u8
 **Input-carrying messages (0x10–0x40) are ignored unless the peer is paired.**
 Unknown types are ignored (forward compatibility).
 
-## 8. Shared-monitor mode ("input follows the monitor")
+## 8. Shared-monitor mode
 
-For two computers sharing one monitor, where one of them has no other screen: the computer whose screen is not
-visible gives all of its input to the other (ENTER edge 4); a visible computer keeps its input until its pointer
-crosses into the area where the other computer is shown. Mouse movement never switches the monitor input.
+For two computers sharing one monitor. Each keyboard and mouse always works on its own computer and moves to
+the other only when its pointer is pushed past the edge that faces the other computer; what the shared monitor
+shows never hands input over by itself, and mouse movement never switches the monitor input.
+
+- While the shared monitor shows the **other** computer, its area on the Mac's desktop *is* that computer: the
+  Mac's pointer crossing onto it starts controlling the other computer, and the other computer's pointer arrives
+  beside it on the Mac's own screens.
+- While it shows the **Mac**, the other computer is beyond the outer edge of the Mac's desktop on the shared
+  monitor's side; its pointer enters and leaves there. The Mac does not cross into the other computer then (it
+  is not visible).
+- The most recently moved mouse wins: crossing over ends any control the other side had on this computer.
+- When the monitor changes computers, any crossed-over pointer is sent home on both sides.
+
+ENTER edge 4 (take over) is reserved by earlier builds and is no longer sent.
 
 ## 9. Safety rules
 

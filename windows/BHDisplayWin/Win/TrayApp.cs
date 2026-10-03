@@ -26,7 +26,8 @@ internal sealed class TrayApp : ApplicationContext
     private bool _running, _controlling, _controlled;
     private uint _clipSeq;
     private bool _showsPc;                                 // the shared monitor currently shows this PC
-    private bool _paused;                                  // Ctrl+Alt+Win+Esc: keep input here until the monitor changes
+    private long _lastHandover;                            // no bouncing straight back across the boundary
+    private bool RecentHandover => Environment.TickCount64 - _lastHandover < 250;
     private string _status = "Off";
     private readonly System.Windows.Forms.Timer _reconnect = new() { Interval = 5000 };
 
@@ -56,7 +57,11 @@ internal sealed class TrayApp : ApplicationContext
         // Everything else runs once the message loop is pumping: low-level hooks are serviced by that loop,
         // and nothing here may delay the tray icon from responding.
         _ui.Post(_ => Startup(), null);
+        // An update or uninstall asks this copy to quit.
+        _quit = new EventWaitHandle(false, EventResetMode.AutoReset, Installer.QuitEventName);
+        new Thread(() => { if (_quit.WaitOne()) Post(ExitThread); }) { IsBackground = true }.Start();
     }
+    private readonly EventWaitHandle _quit;
 
     private void Startup()
     {
@@ -83,12 +88,19 @@ internal sealed class TrayApp : ApplicationContext
 
     private void Switch(byte code)
     {
+        Log.Write($"switch to {Ddc.NameOf(code)} requested here (Mac port {Ddc.NameOf(_settings.MacPort)}, connected: {_session is not null})");
         // Going back to the Mac: let the Mac do it — it may have turned its output off while the monitor
         // showed this PC, and must turn it on before the monitor switches (or the monitor sees no signal).
         if (code == _settings.MacPort && _session is not null)
         {
             _session.Send(new ShareMsg.SwitchRequest(code));
             Log.Write($"asked the Mac to switch the monitor to {Ddc.NameOf(code)}");
+            var asked = _session;
+            _ = Task.Delay(10000).ContinueWith(_ => Post(() =>
+            {   // no MONITOR_SHOWS answer: tell the user instead of failing silently
+                if (_session == asked && _showsPc) { Log.Write("the Mac did not switch the monitor within 10 s");
+                    _icon.ShowBalloonTip(4000, "BHDisplay", "The Mac didn't switch the monitor. Is BHDisplay running on the Mac?", ToolTipIcon.Warning); }
+            }));
             return;
         }
         if (!Ddc.Switch(code))
@@ -96,6 +108,8 @@ internal sealed class TrayApp : ApplicationContext
             _icon.ShowBalloonTip(3000, "BHDisplay", "Couldn't switch the monitor. Turn on Setup Menu ▸ DDC/CI on the monitor.", ToolTipIcon.Warning);
             return;
         }
+        if (code == _settings.MacPort)
+            _icon.ShowBalloonTip(4000, "BHDisplay", "Switched without the Mac connected — if the Mac's output to the monitor is off, it shows no signal.", ToolTipIcon.Info);
         _session?.Send(new ShareMsg.MonitorShows(code));   // the Mac follows what the monitor shows
         MonitorNowShows(code);
     }
@@ -105,33 +119,29 @@ internal sealed class TrayApp : ApplicationContext
     private void MonitorNowShows(byte code)
     {
         bool showsPc = code == _settings.PcPort;
-        if (showsPc != _showsPc) { _showsPc = showsPc; _paused = false; Log.Write($"monitor shows {(showsPc ? "this PC" : "the Mac")} ({Ddc.NameOf(code)})"); }
-        ApplyMode();
+        bool changed = showsPc != _showsPc;
+        if (changed) { _showsPc = showsPc; Log.Write($"monitor shows {(showsPc ? "this PC" : "the Mac")} ({Ddc.NameOf(code)})"); }
+        ApplyMode(changed);
     }
 
-    private void ApplyMode()
+    /// modeChanged: the monitor just changed computers. Only then is a crossed-over pointer brought back;
+    /// a repeated "monitor shows" must not cancel a crossing made on purpose.
+    private void ApplyMode(bool modeChanged = false)
     {
         if (!_running) return;
-        _capture.WatchEdge = _showsPc;
-        if (_showsPc)
-        {
-            if (_controlling) StopControlling();            // visible again: Windows input belongs here
-        }
-        else
-        {
-            if (_controlled) { _emu.Leave(); _controlled = false; }
-            if (!_controlling && !_paused && _session is not null) StartTakeover();
+        // Each keyboard/mouse works on its own computer and crosses only at the edge, whatever the monitor shows.
+        _capture.WatchEdge = true;
+        if (modeChanged)
+        {   // the screens moved under any crossed-over pointer: bring it home on both sides
+            if (_controlling) StopControlling();
+            if (_controlled)
+            {   // tell the Mac, or it keeps swallowing its own keyboard/mouse
+                _emu.Leave(); _controlled = false;
+                _session?.Send(new ShareMsg.Leave(4, 0.5f));
+                Log.Write("monitor changed: the Mac gets its keyboard/mouse back");
+            }
         }
         UpdateStatus();
-    }
-
-    private void StartTakeover()
-    {
-        SendClipboardIfChanged();
-        _session!.Send(new ShareMsg.Enter(4, 0.5f));
-        _capture.Begin(0);
-        _controlling = true;
-        Log.Write("→ controlling the Mac (take-over: the monitor shows the Mac)");
     }
 
     private void StopControlling()
@@ -159,7 +169,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         switch (hid)
         {
-            case 0x29: _paused = true; StopControlling(); UpdateStatus(); break;   // Esc: take this PC's input back
+            case 0x29: StopControlling(); UpdateStatus(); break;   // Esc: take this PC's input back
             case 0x16: ToggleMonitor(); break;     // S
             case 0x1E: Switch(0x0F); break;        // 1
             case 0x1F: Switch(0x12); break;        // 2
@@ -357,7 +367,11 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (m is ShareMsg.PairConfirm && _pairing?.S == s) { _pairing = (s, _pairing.Value.Local, true); FinishPairing(); return; }
         if (m is ShareMsg.PairReject && _pairing?.S == s) { s.Close("pairing declined on the other computer"); return; }
-        if (s != _session) return;                         // input only from the paired, active session
+        if (s != _session)                                 // input only from the paired, active session
+        {
+            if (m is not (ShareMsg.Ping or ShareMsg.Pong)) Log.Write($"ignored {m.GetType().Name} from a connection that is not the active one");
+            return;
+        }
         switch (m)
         {
             case ShareMsg.Enter e:
@@ -366,14 +380,15 @@ internal sealed class TrayApp : ApplicationContext
                 {   // the Mac tells us which of our edges faces it (from its display arrangement)
                     _settings.MacEdge = e.Edge; _settings.Save(); _capture.Edge = _emu.Edge = e.Edge;
                 }
-                _emu.Enter(e.Position, takeover: e.Edge == 4); _controlled = true;
+                _emu.Enter(e.Position, takeover: e.Edge == 4); _controlled = true; _lastHandover = Environment.TickCount64;
                 Log.Write($"← the Mac is controlling this PC ({(e.Edge == 4 ? "take-over" : "came across")})");
                 break;
             case ShareMsg.Leave l:
-                if (_controlling) { _capture.End(_showsPc ? l.Position : null); _controlling = false; Log.Write("← back on this PC"); }
+                if (_controlling) { _capture.End(l.Position); _controlling = false; Log.Write("← back on this PC"); }
                 else if (_controlled) { _emu.Leave(); _controlled = false; Log.Write("the Mac stopped controlling this PC"); }
                 break;
             case ShareMsg.MonitorShows ms when Ddc.IsInput(ms.Code):
+                Log.Write($"the Mac says the monitor shows {Ddc.NameOf(ms.Code)}");
                 MonitorNowShows(ms.Code); break;
             case ShareMsg.Move mv: if (_controlled) _emu.Move(mv.Dx, mv.Dy); break;
             case ShareMsg.Button b: if (_controlled) _emu.Button(b.Number, b.Down); break;
@@ -391,7 +406,9 @@ internal sealed class TrayApp : ApplicationContext
 
     private bool EdgeHit(float pos)
     {
-        if (!_running || _session is null || _controlled || !_showsPc) return false;
+        if (!_running || _session is null || RecentHandover) return false;
+        _lastHandover = Environment.TickCount64;
+        if (_controlled) { _emu.Leave(); _controlled = false; }   // our own mouse wins: the Mac's pointer was here
         SendClipboardIfChanged();
         Log.Write("→ controlling the Mac (pointer crossed the edge)");
         _session.Send(new ShareMsg.Enter((byte)(1 - _settings.MacEdge), pos));   // enters the Mac's facing edge
@@ -402,8 +419,10 @@ internal sealed class TrayApp : ApplicationContext
 
     private void PeerPointerLeft(float pos)
     {
+        // No time guard here: the emulator has already let go, so the Mac MUST be told, or it keeps sending into nothing.
         if (!_controlled || _session is null) return;
         _controlled = false;
+        _lastHandover = Environment.TickCount64;
         Log.Write("→ pointer reached the edge: back to the Mac");
         SendClipboardIfChanged();
         _session.Send(new ShareMsg.Leave((byte)_settings.MacEdge, pos));
