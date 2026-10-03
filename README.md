@@ -217,7 +217,7 @@ See [SECURITY.md](SECURITY.md) to report a problem.
 Needs Xcode (or the Command Line Tools) — no Xcode project, no dependencies.
 
 ```bash
-./build.sh            # → build/BHDisplay.app
+./build.sh            # → build.noindex/BHDisplay.app
 ./build.sh --install  # build and install to /Applications
 ./make-dist.sh        # → dist/BHDisplay-<ver>.dmg + .pkg
 ```

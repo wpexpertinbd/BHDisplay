@@ -9,9 +9,10 @@ NAME=BHDisplay
 BUNDLE_ID=com.biswashost.bhdisplay
 VERSION=1.1.1
 BUILD_NUM=4
-APP=build/$NAME.app
+# ".noindex" keeps Spotlight/Launchpad from listing this development copy next to the installed app.
+APP=build.noindex/$NAME.app
 
-rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+rm -rf build build.noindex && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 swiftc -O -parse-as-library -target arm64-apple-macos14.0 \
   -import-objc-header Sources/Bridge.h \
@@ -41,7 +42,6 @@ SIGN_ID="${SIGN_ID:-BHTerminal Dev}"
 codesign --force --options runtime --timestamp=none --sign "$SIGN_ID" "$APP"
 codesign --verify --strict "$APP"
 # Keep the dev copy out of Spotlight / "Open With": only /Applications/BHDisplay.app should be registered.
-touch build/.metadata_never_index
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$APP" 2>/dev/null || true
 
 if [[ "${1:-}" == "--install" ]]; then

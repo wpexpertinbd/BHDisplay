@@ -8,7 +8,7 @@ set -euo pipefail
 cd "${0:A:h}"
 
 ./build.sh
-APP=build/BHDisplay.app
+APP=build.noindex/BHDisplay.app
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")
 BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Contents/Info.plist")
 echo "==> Packaging BHDisplay v$VERSION"
