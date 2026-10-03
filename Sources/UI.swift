@@ -217,14 +217,10 @@ struct ContentView: View {
     }
 
     @ObservedObject private var share = ShareController.shared
-    @ObservedObject private var lanMouse = SharingModel.shared      // fallback only
 
     private var sharingCard: some View {
         Card(title: "Keyboard & Mouse", icon: "keyboard", trailing: {
-            Toggle("", isOn: Binding(get: { share.enabled }, set: { on in
-                if on, lanMouse.isOn { lanMouse.set(false) }
-                share.enabled = on
-            }))
+            Toggle("", isOn: Binding(get: { share.enabled }, set: { share.enabled = $0 }))
             .toggleStyle(.switch).labelsHidden().tint(accent)
         }) {
             VStack(alignment: .leading, spacing: 8) {
@@ -270,14 +266,9 @@ struct ContentView: View {
                 HStack {
                     Text("Moving the mouse never changes the monitor.").font(.system(size: 10)).foregroundStyle(.secondary)
                     Spacer()
-                    if !share.enabled && lanMouse.state != .notInstalled {
-                        Toggle("Lan Mouse (fallback)", isOn: Binding(get: { lanMouse.isOn }, set: { lanMouse.set($0) }))
-                            .toggleStyle(.checkbox).font(.system(size: 10)).disabled(lanMouse.busy)
-                    }
                 }
             }
         }
-        .onAppear { lanMouse.refresh() }
     }
 
     private var colorCard: some View {

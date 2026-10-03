@@ -192,8 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         status.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "BHDisplay")
         let menu = NSMenu(); menu.delegate = self; status.menu = menu
         registerHotKeys()
-        SharingModel.shared.refresh()
-        InputSharing.trimLog()
+        LegacyCleanup.removeOldSharingJob()
         ShareController.shared.bootstrap()
         m.refresh()
         // Re-read when the monitor is plugged/unplugged or wakes.
@@ -284,8 +283,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 menu.addItem(p)
             }
         }
-        let sh = SharingModel.shared
-        sh.refresh()
         menu.addItem(.separator())
         let l = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: ""); l.target = self
         switch SMAppService.mainApp.status {
@@ -302,7 +299,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc private func toggle() { m.toggleMacOther() }
     @objc private func toggleSharing() {
         let share = ShareController.shared
-        if !share.enabled, SharingModel.shared.isOn { SharingModel.shared.set(false) }
         share.enabled.toggle()
         if share.enabled && share.needsAccessibility { showWindow() }
     }
@@ -310,8 +306,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let share = ShareController.shared
         if let id = item.representedObject as? String, let d = share.discovered.first(where: { $0.id == id }) { share.pair(with: d) }
     }
-    @objc private func lanMouseSettings() { InputSharing.openSettings() }
-    @objc private func getLanMouse() { NSWorkspace.shared.open(InputSharing.releasesURL) }
 
     @objc private func showAbout() {
         let credits = NSMutableAttributedString()

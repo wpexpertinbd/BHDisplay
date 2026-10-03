@@ -67,8 +67,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         do { identity = try ShareIdentity.loadOrCreate() } catch { status = "Can't create identity: \(error)"; return }
         guard let identity else { return }
         guard capture.start() else { needsAccessibility = true; status = "Needs Accessibility permission"; return }
-        // Lan Mouse would capture the same edge — only one sharing tool may run.
-        if case .running = InputSharing.state() { InputSharing.disable() }
+        LegacyCleanup.removeOldSharingJob()
 
         listener.onSession = { [weak self] s in self?.q.async { self?.adopt(s) } }
         listener.onError = { [weak self] e in Task { @MainActor in self?.status = e } }
