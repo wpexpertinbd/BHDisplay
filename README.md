@@ -196,8 +196,8 @@ already part of Windows, so there is nothing else to install).
   it on. Every connection is **encrypted** (AES-256-GCM, fresh keys per session) and
   **authenticated** with each computer's own key; only a **paired** computer can type or click,
   and pairing needs a person to start it on that computer and confirm a 6-digit code on both
-  screens (the code can't be forced to match by someone in between). The Mac keeps its key and
-  paired list in the **Keychain**. Password-manager clipboard items are never sent.
+  screens (the code can't be forced to match by someone in between). The Mac never accepts or makes a
+  sharing connection on its own addresses. Password-manager clipboard items are never sent.
 - **No admin rights, no helper tools, no kernel extensions.** Sharing needs the Mac's
   Accessibility permission (to read and type keys); monitor control needs nothing.
 - **Replies from the monitor are validated** (address, length and checksum) before use; saved

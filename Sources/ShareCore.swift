@@ -59,33 +59,51 @@ struct WireReader {
 
 // MARK: - Identity
 
-/// Secrets kept in the login Keychain, readable without a prompt only by this app (its code signature):
-/// other programs running as the same user can't copy the identity key or add themselves to the paired list.
-enum ShareKeychain {
-    private static let service = "com.biswashost.bhdisplay.sharing"
+/// Private files under ~/Library/Application Support/BHDisplay (folder 0700, files 0600). Not the Keychain:
+/// without a paid Apple certificate every new build looks like a different app to the Keychain, which then asks
+/// for the password at login after each update — and a read refused at that moment must never look like
+/// "nothing saved". Other programs running as this user could read these files (same as the Windows app);
+/// connections from this Mac itself are refused, so they can't use BHDisplay to type.
+enum ShareStore {
+    enum ReadResult { case found(Data), notFound, unreadable(String) }
 
-    static func read(_ account: String) -> Data? {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                kSecAttrAccount as String: account, kSecReturnData as String: true,
-                                kSecMatchLimit as String: kSecMatchLimitOne]
-        var out: CFTypeRef?
-        return SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess ? out as? Data : nil
+    static var folder: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("BHDisplay", isDirectory: true)
     }
 
-    @discardableResult
-    static func write(_ account: String, _ data: Data) -> Bool {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                kSecAttrAccount as String: account]
-        if SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary) == errSecSuccess { return true }
-        var add = q
-        add[kSecValueData as String] = data
-        add[kSecAttrLabel as String] = "BHDisplay keyboard & mouse sharing"
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    /// `.notFound` only when the file really doesn't exist; any other failure is `.unreadable` (never overwrite).
+    static func read(_ name: String) -> ReadResult {
+        let url = folder.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: url.path) else { return .notFound }
+        do { return .found(try Data(contentsOf: url)) } catch { return .unreadable("\(error.localizedDescription)") }
+    }
+
+    /// Moves a damaged file out of the way (kept for inspection) so a fresh one can be written.
+    static func setAside(_ name: String) {
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+        let url = folder.appendingPathComponent(name)
+        try? FileManager.default.moveItem(at: url, to: folder.appendingPathComponent(name + ".damaged-" + f.string(from: Date())))
+    }
+
+    /// Atomic write, owner-only permissions.
+    static func write(_ name: String, _ data: Data) -> Bool {
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let url = folder.appendingPathComponent(name)
+            let tmp = folder.appendingPathComponent(name + ".tmp")
+            try? fm.removeItem(at: tmp)
+            guard fm.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: 0o600]) else { return false }
+            _ = try fm.replaceItemAt(url, withItemAt: tmp)
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return true
+        } catch { return false }
     }
 }
 
 /// Long-term device identity: a random device id and a P-256 signing key, created once and kept in the
-/// Keychain. (Earlier builds kept it in a 0600 file; it is moved into the Keychain and the file deleted.)
+/// private file `identity` (see ShareStore).
 final class ShareIdentity: @unchecked Sendable {   // immutable after init
     let deviceID: Data
     let signingKey: P256.Signing.PrivateKey
@@ -103,11 +121,6 @@ final class ShareIdentity: @unchecked Sendable {   // immutable after init
     }
     #endif
 
-    static var legacyFileURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("BHDisplay", isDirectory: true).appendingPathComponent("identity")
-    }
-
     private static func parse(_ d: Data, name: String) -> ShareIdentity? {
         guard d.count == 48, let key = try? P256.Signing.PrivateKey(rawRepresentation: d.subdata(in: 16..<48)) else { return nil }
         return ShareIdentity(deviceID: d.subdata(in: 0..<16), key: key, name: name)
@@ -115,19 +128,19 @@ final class ShareIdentity: @unchecked Sendable {   // immutable after init
 
     static func loadOrCreate() throws -> ShareIdentity {
         let name = String((Host.current().localizedName ?? "Mac").prefix(64))
-        if let d = ShareKeychain.read("identity"), let id = parse(d, name: name) { return id }
-        // Move an identity from the old file into the Keychain (keeps existing pairings working).
-        let file = legacyFileURL
-        if let d = try? Data(contentsOf: file), let id = parse(d, name: name) {
-            guard ShareKeychain.write("identity", d) else { throw WireError.bad("cannot save the sharing key in the Keychain") }
-            try? FileManager.default.removeItem(at: file)
-            return id
+        switch ShareStore.read("identity") {
+        case .found(let d):
+            if let id = parse(d, name: name) { return id }
+            ShareStore.setAside("identity")      // damaged: keep a copy, make a new key (pair again once)
+        case .unreadable(let why):
+            throw WireError.bad("the saved sharing key can't be read (\(why))")   // never replace it
+        case .notFound: break
         }
         var id = Data(count: 16)
         guard id.withUnsafeMutableBytes({ SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }) == errSecSuccess
         else { throw WireError.bad("no randomness") }
         let key = P256.Signing.PrivateKey()
-        guard ShareKeychain.write("identity", id + key.rawRepresentation) else { throw WireError.bad("cannot save the sharing key in the Keychain") }
+        guard ShareStore.write("identity", id + key.rawRepresentation) else { throw WireError.bad("cannot save the sharing key") }
         return ShareIdentity(deviceID: id, key: key, name: name)
     }
 }

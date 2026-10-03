@@ -18,14 +18,19 @@ You'll get a response as soon as possible.
   P-256 identities, a commit-then-reveal handshake so the 6-digit pairing code can't be steered by
   someone in between, ECDH + HKDF session keys, AES-256-GCM records. Only a paired, authenticated
   peer's input is replayed; a pairing is accepted only for 2 minutes after a person chooses
-  *Pair a new computer…* on that computer, and the Pair button has no keyboard shortcut. On the
-  Mac the identity key and paired list live in the Keychain. Discovery and handshakes are rate-
-  and size-limited. Password-manager (concealed) clipboard items are never sent.
+  *Pair a new computer…* on that computer, and the Pair button has no keyboard shortcut.
+  The Mac never accepts, dials or listens to beacons from its own addresses (loopback and every local
+  interface), in either direction.
+  Discovery and handshakes are rate- and size-limited. Password-manager (concealed) clipboard items are never sent.
 - **No admin privileges.** No helper tool, no kernel extension. Sharing needs the Accessibility
   permission (to read and type keys); global shortcuts use the Carbon hot-key API, which needs none.
-- **Windows:** the identity key is DPAPI-protected for the current user. Known limit — like any
-  Windows app's data, other programs running as the same user could read it; Windows has no
-  per-app equivalent of the Mac Keychain.
+- **Where the keys live:** Mac — private files in `~/Library/Application Support/BHDisplay`
+  (folder 0700, files 0600); Windows — DPAPI-protected for the current user. Known limit: a program
+  already running as the same user could read or change them (e.g. pose as the paired computer from
+  another machine it controls). That is outside what an app without a paid code-signing identity can
+  protect against on either OS; it needs malware already on your account. (The Mac Keychain was tried in 1.1.x: without a
+  paid Apple certificate it asks for the login password after every update, and a refused prompt at
+  login could lose the pairing — so 1.1.2 went back to private files.)
 - **Talks only to the monitor**, over DDC/CI on the display cable, through the Apple Silicon
   display controller (private IOKit I²C functions declared in `Sources/Bridge.h`).
 - **Monitor replies are untrusted input.** Every reply is checked for the expected source

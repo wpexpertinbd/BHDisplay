@@ -30,6 +30,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     @Published var peerScrollSpeed: Double { didSet { UserDefaults.standard.set(peerScrollSpeed, forKey: "sharePeerScrollSpeed"); emulator.scrollSpeed = peerScrollSpeed } }
     @Published var swapCmdCtrl: Bool { didSet { UserDefaults.standard.set(swapCmdCtrl, forKey: "shareSwapCmdCtrl"); capture.swapCmdCtrl = swapCmdCtrl; emulator.swapCmdCtrl = swapCmdCtrl } }
     @Published private(set) var paired: [String: String]
+    private var pairedLoaded = false
 
     private let q = DispatchQueue(label: "com.biswashost.bhdisplay.share")
     private var identity: ShareIdentity?
@@ -59,7 +60,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         swapCmdCtrl = d.object(forKey: "shareSwapCmdCtrl") as? Bool ?? true
         peerMouseSpeed = min(max(d.object(forKey: "sharePeerMouseSpeed") as? Double ?? 1, 0.5), 3)
         peerScrollSpeed = min(max(d.object(forKey: "sharePeerScrollSpeed") as? Double ?? 1, 0.5), 5)
-        paired = ShareController.loadPaired()
+        let p = ShareController.loadPaired()
+        paired = p ?? [:]
+        pairedLoaded = p != nil
         super.init()
         capture.delegate = self
         capture.swapCmdCtrl = swapCmdCtrl; emulator.swapCmdCtrl = swapCmdCtrl; emulator.speed = peerMouseSpeed; emulator.scrollSpeed = peerScrollSpeed
@@ -79,7 +82,13 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             return
         }
         needsAccessibility = false
-        do { identity = try ShareIdentity.loadOrCreate() } catch { status = "Can't create identity: \(error)"; return }
+        ensurePairedLoaded()
+        do { identity = try ShareIdentity.loadOrCreate() } catch {
+            status = "Sharing can't start yet: \(error)"
+            ShareLog.write(status)
+            q.asyncAfter(deadline: .now() + 10) { [weak self] in Task { @MainActor in if self?.enabled == true, self?.running == false { self?.start() } } }
+            return
+        }
         guard let identity else { return }
         guard capture.start() else { needsAccessibility = true; status = "Needs Accessibility permission"; return }
         LegacyCleanup.removeOldSharingJob()
@@ -87,8 +96,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
 
         listener.onSession = { [weak self] s in
             // Sharing is between two computers: a connection from this Mac itself is never a peer.
-            let h = s.remoteHost
-            if h.hasPrefix("127.") || h.hasPrefix("::1") || h.hasPrefix("::ffff:127.") { s.close("refused: connection from this Mac"); return }
+            if ShareController.isLocalHost(s.remoteHost) { s.close("refused: connection from this Mac"); return }
             self?.q.async { self?.adopt(s) }
         }
         listener.onError = { [weak self] e in Task { @MainActor in self?.listenerFailed(e) } }
@@ -97,7 +105,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         discovery.start(identity: identity, queue: q)
         running = true
         timers = [
-            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.reconnectKnownPeers() } },
+            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.ensurePairedLoaded(); self?.reconnectKnownPeers() } },
             // Secure keyboard entry switched on while forwarding: keys would go to the Mac app — stop forwarding.
             Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -261,7 +269,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     private func isPaired(prefix: Data) -> Bool { paired.keys.contains { Data(hexString: $0)?.prefix(8) == prefix } }
 
     private func beacon(_ b: ShareDiscovery.Beacon) {
-        guard running, let identity else { return }
+        guard running, let identity, !ShareController.isLocalHost(b.host) else { return }
         let key = b.deviceID.hex
         if isPaired(prefix: b.fingerprintPrefix) {
             discovered.removeAll { $0.id == key }
@@ -279,7 +287,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     }
 
     private func dial(host: String, port: UInt16) {
-        guard let identity else { return }
+        guard let identity, !ShareController.isLocalHost(host) else { return }
         dialing.insert(host)
         let s = ShareSession.dial(host: host, port: port, identity: identity, queue: q)
         q.asyncAfter(deadline: .now() + 10) { [weak self] in Task { @MainActor in self?.dialing.remove(host) } }
@@ -312,29 +320,75 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     }
 
     func forget(_ fingerprintHex: String) {
+        guard ensurePairedLoaded() else { status = "Paired computers can't be read right now — try again"; return }
+        let before = paired
         paired.removeValue(forKey: fingerprintHex)
-        ShareController.savePaired(paired)
+        guard ShareController.savePaired(paired) else {
+            paired = before; status = "Couldn't save — the computer is still paired. Try again"; ShareLog.write(status); return
+        }
         peerHosts.removeValue(forKey: fingerprintHex)
         UserDefaults.standard.set(peerHosts, forKey: "sharePeerHosts")
         if session?.peerFingerprint.hex == fingerprintHex { session?.close("forgotten") }
     }
 
-    /// The paired list lives in the Keychain: a program that can only write our preferences can't add itself.
-    private static func loadPaired() -> [String: String] {
-        if let d = ShareKeychain.read("paired"), let p = try? JSONDecoder().decode([String: String].self, from: d) {
+    /// The paired list lives in a private file. nil = it exists but can't be read right now: then NOTHING is
+    /// written, so a passing problem can never replace the saved pairings with an empty list.
+    private static func loadPaired() -> [String: String]? {
+        switch ShareStore.read("paired.json") {
+        case .found(let d):
+            guard let p = try? JSONDecoder().decode([String: String].self, from: d) else {
+                // Damaged (not just unreadable): keep a copy aside and start empty — pair again once.
+                ShareStore.setAside("paired.json")
+                ShareLog.write("paired.json was damaged — kept as paired.json.damaged-*; pair your computer again")
+                return [:]
+            }
             return p.filter { Data(hexString: $0.key)?.count == 32 }
+        case .unreadable(let why):
+            ShareLog.write("paired computers can't be read yet (\(why))")
+            return nil
+        case .notFound:
+            return [:]
         }
-        // One-time move from the preferences file used by earlier builds.
-        let old = UserDefaults.standard.dictionary(forKey: "sharePaired") as? [String: String] ?? [:]
-        let valid = old.filter { Data(hexString: $0.key)?.count == 32 }
-        if savePaired(valid) { UserDefaults.standard.removeObject(forKey: "sharePaired") }
-        return valid
+    }
+
+    /// True if `host` is one of this Mac's own addresses (any interface). Software running on this Mac can only
+    /// connect from these, so refusing them means it can never use BHDisplay to type or click here.
+    /// Loopback or one of this Mac's own addresses.
+    nonisolated static func isLocalHost(_ host: String) -> Bool {
+        host.hasPrefix("127.") || host.hasPrefix("::1") || host.hasPrefix("::ffff:127.") || host == "localhost" || isOwnAddress(host)
+    }
+
+    nonisolated static func isOwnAddress(_ host: String) -> Bool {
+        let h = host.split(separator: "%").first.map(String.init) ?? host
+        let bare = h.hasPrefix("::ffff:") ? String(h.dropFirst(7)) : h
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return true }   // can't tell → treat as local (refuse)
+        defer { freeifaddrs(list) }
+        for p in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let sa = p.pointee.ifa_addr else { continue }
+            var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let len = socklen_t(sa.pointee.sa_family == UInt8(AF_INET6) ? MemoryLayout<sockaddr_in6>.size : MemoryLayout<sockaddr_in>.size)
+            guard sa.pointee.sa_family == UInt8(AF_INET) || sa.pointee.sa_family == UInt8(AF_INET6),
+                  getnameinfo(sa, len, &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let addr = String(cString: buf).split(separator: "%").first.map(String.init) ?? ""
+            if addr == bare { return true }
+        }
+        return false
     }
 
     @discardableResult
     private static func savePaired(_ p: [String: String]) -> Bool {
         guard let d = try? JSONEncoder().encode(p) else { return false }
-        return ShareKeychain.write("paired", d)
+        return ShareStore.write("paired.json", d)
+    }
+
+    /// Loads the paired list if an earlier attempt failed. False = still unreadable (don't change it then).
+    @discardableResult
+    private func ensurePairedLoaded() -> Bool {
+        if pairedLoaded { return true }
+        guard let p = ShareController.loadPaired() else { return false }
+        paired = p; pairedLoaded = true
+        return true
     }
 
     nonisolated private func adopt(_ s: ShareSession) {
@@ -356,6 +410,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
 
     private func ready(_ s: ShareSession) {
         guard running else { s.close("not running"); return }
+        // Never from this Mac, in either direction: local software could otherwise answer our own dial on one of
+        // our addresses and pose as the paired computer.
+        guard !ShareController.isLocalHost(s.remoteHost) else { s.close("refused: this Mac's own address"); return }
         let fp = s.peerFingerprint.hex
         if paired[fp] != nil {
             pending.removeValue(forKey: ObjectIdentifier(s))
@@ -436,8 +493,12 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         let s = p.session
         pairing = nil
         pairArmedUntil = .distantPast
+        guard ensurePairedLoaded() else { s.close("paired computers can't be read right now"); status = "Couldn't save the pairing — try again"; return }
+        let before = paired
         paired[s.peerFingerprint.hex] = s.peer?.name ?? "Computer"
-        ShareController.savePaired(paired)
+        guard ShareController.savePaired(paired) else {
+            paired = before; s.close("pairing couldn't be saved"); status = "Couldn't save the pairing — try again"; ShareLog.write(status); return
+        }
         ShareLog.write("paired with \(s.peer?.name ?? "?")")
         ready(s)
     }
