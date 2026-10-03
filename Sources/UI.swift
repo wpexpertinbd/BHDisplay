@@ -149,6 +149,15 @@ struct ContentView: View {
                     }
                     .controlSize(.large)
                 }
+                if m.macDisplayOff {
+                    Label("This Mac's display output to the monitor is off while it shows the other computer — your windows are on the MacBook screen.",
+                          systemImage: "display.trianglebadge.exclamationmark")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+                }
+                Toggle("Turn this display off on the Mac while it shows the other computer",
+                       isOn: Binding(get: { m.turnOffWhenOther }, set: { m.turnOffWhenOther = $0 }))
+                    .toggleStyle(.checkbox).font(.system(size: 11))
                 if let n = m.notice {
                     Label(n, systemImage: "moon.zzz.fill")
                         .font(.system(size: 11)).foregroundStyle(.orange)
@@ -254,14 +263,6 @@ struct ContentView: View {
                     }
                     if share.connectedName == nil {
                         Button("Connect by IP address…") { askForAddress() }.controlSize(.small)
-                    }
-                    HStack(spacing: 8) {
-                        Text("Other computer is on the").font(.system(size: 12))
-                        Picker("", selection: Binding(get: { share.side }, set: { share.side = $0 })) {
-                            Text("Left").tag(ShareEdge.left)
-                            Text("Right").tag(ShareEdge.right)
-                        }
-                        .pickerStyle(.segmented).labelsHidden().frame(width: 120)
                     }
                     Toggle("⌘ on the Mac = Ctrl on Windows", isOn: Binding(get: { share.swapCmdCtrl }, set: { share.swapCmdCtrl = $0 }))
                         .font(.system(size: 12)).toggleStyle(.checkbox)

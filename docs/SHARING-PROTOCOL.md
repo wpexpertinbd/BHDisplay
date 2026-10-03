@@ -89,7 +89,7 @@ frame. A frame that fails to decrypt closes the connection. Plaintext = `type u8
 | 0x02 | PONG | — | |
 | 0x05 | PAIR_CONFIRM | — | user accepted the code on the sender |
 | 0x06 | PAIR_REJECT | — | user rejected; close |
-| 0x10 | ENTER | edge u8, position f32 (0…1) | sender starts controlling the receiver; the receiver's pointer appears at its `edge` (0 left, 1 right, 2 top, 3 bottom) at `position` along it |
+| 0x10 | ENTER | edge u8, position f32 (0…1) | sender starts controlling the receiver; the receiver's pointer appears at its `edge` (0 left, 1 right, 2 top, 3 bottom) at `position` along it. Edge **4 = take over**: the pointer is not moved and is not handed back at an edge (used when the sender's screen is not visible) |
 | 0x11 | LEAVE | edge u8, position f32 | the controlled pointer left through the receiver's-side edge back toward the controller; the controller stops capturing and resumes locally |
 | 0x20 | MOVE | dx i16, dy i16 | relative pointer motion, screen points |
 | 0x21 | BUTTON | button u8 (1 left, 2 right, 3 middle, 4 back, 5 forward), down u8 | |
@@ -98,11 +98,19 @@ frame. A frame that fails to decrypt closes the connection. Plaintext = `type u8
 | 0x31 | RELEASE_ALL | — | release every key and button this peer pressed |
 | 0x40 | CLIPBOARD | UTF-8 text (≤ 256 KiB) | sent when control moves to the other computer and the text changed |
 | 0x50 | MONITOR_PORTS | mac port u8, other port u8 | the monitor's VCP 0x60 values for "this Mac" and "the other computer", sent by the Mac |
+| 0x51 | MONITOR_SHOWS | input u8 | the shared monitor now shows this input (VCP 0x60 value); whoever switches it, or notices a change, tells the other |
+| 0x52 | SWITCH_REQUEST | input u8 | ask the other computer to switch the shared monitor to this input (it may first need to turn its own output to the monitor back on) |
 
 **Input-carrying messages (0x10–0x40) are ignored unless the peer is paired.**
 Unknown types are ignored (forward compatibility).
 
-## 8. Safety rules
+## 8. Shared-monitor mode ("input follows the monitor")
+
+For two computers sharing one monitor, where one of them has no other screen: the computer whose screen is not
+visible gives all of its input to the other (ENTER edge 4); a visible computer keeps its input until its pointer
+crosses into the area where the other computer is shown. Mouse movement never switches the monitor input.
+
+## 9. Safety rules
 
 - On disconnect, on LEAVE, and on RELEASE_ALL the receiving side releases every key and button it pressed
   on behalf of the peer. A capturing side that loses its connection stops capturing immediately.

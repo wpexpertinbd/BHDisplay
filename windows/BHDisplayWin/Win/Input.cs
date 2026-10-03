@@ -12,6 +12,7 @@ internal static class Tag { public const nuint Injected = 0x42484453; }   // "BH
 internal sealed class Capture : IDisposable
 {
     public int Edge = 0;                                   // 0 = Mac is on the left, 1 = right
+    public bool WatchEdge;                                 // only while the shared monitor shows this PC
     public bool Capturing { get; private set; }
     public Func<float, bool>? EdgeHit;                     // return true to start capturing
     public Action<ShareMsg>? Captured;
@@ -66,7 +67,7 @@ internal sealed class Capture : IDisposable
             {
                 var towards = Edge == 0 ? m.pt.X <= _last.X : m.pt.X >= _last.X;
                 _last = m.pt;
-                if (towards && Screens.Hit(m.pt, Edge) is { } pos && EdgeHit?.Invoke(pos) == true)
+                if (WatchEdge && towards && Screens.Hit(m.pt, Edge) is { } pos && EdgeHit?.Invoke(pos) == true)
                 {
                     Begin(m.pt.Y);
                     return 1;
@@ -142,11 +143,14 @@ internal sealed class Emulator
         u = new InputUnion { mi = new MOUSEINPUT { dx = dx, dy = dy, mouseData = data, dwFlags = flags, dwExtraInfo = Tag.Injected } },
     };
 
-    public void Enter(float position)
+    private bool _handBack;                                // false = take-over: no hand-back at an edge
+
+    /// takeover: the pointer is not moved and never handed back by position (the Mac's screen is hidden).
+    public void Enter(float position, bool takeover = false)
     {
         Active = true;
-        var p = Screens.EntryPoint(Edge, position);
-        MoveTo(p);
+        _handBack = !takeover;
+        if (!takeover) MoveTo(Screens.EntryPoint(Edge, position));
     }
 
     public void Leave() { ReleaseAll(); Active = false; }
@@ -164,7 +168,7 @@ internal sealed class Emulator
         GetCursorPos(out var cur);
         var p = Screens.Clamp(new POINT { X = cur.X + dx, Y = cur.Y + dy });
         MoveTo(p);
-        bool pushingOut = Edge == 0 ? dx < 0 : dx > 0;
+        bool pushingOut = _handBack && (Edge == 0 ? dx < 0 : dx > 0);
         if (pushingOut && Screens.Hit(p, Edge) is { } pos) { Leave(); Left?.Invoke(pos); }
     }
 

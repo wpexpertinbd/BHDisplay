@@ -9,7 +9,7 @@ void Wire(ShareSession s)
     s.Ready += x =>
     {
         Console.WriteLine($"CODE {x.PairCode}"); Console.WriteLine($"PEER {x.Peer?.Name}");
-        x.Send(new ShareMsg.Move(7, -9)); x.Send(new ShareMsg.Key(0xE3, true)); x.Send(new ShareMsg.Clipboard("ঢাকা ✓ csharp"));
+        x.Send(new ShareMsg.Enter(4, 0.25f)); x.Send(new ShareMsg.SwitchRequest(0x12)); x.Send(new ShareMsg.Clipboard("ঢাকা ✓ csharp"));
     };
     s.Message += (x, m) =>
     {

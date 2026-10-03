@@ -7,9 +7,6 @@ import ApplicationServices
 /// Injected events carry this in kCGEventSourceUserData so our own tap ignores them (no feedback loops).
 let kShareInjectedTag: Int64 = 0x4248_4453   // "BHDS"
 
-enum ShareEdge: UInt8 { case left = 0, right = 1, top = 2, bottom = 3
-    var opposite: ShareEdge { switch self { case .left: return .right; case .right: return .left; case .top: return .bottom; case .bottom: return .top } }
-}
 
 // MARK: - Key map: macOS virtual key codes ↔ USB HID usage IDs (Keyboard/Keypad page 0x07)
 
@@ -61,49 +58,10 @@ enum ShareScreens {
         guard CGGetActiveDisplayList(16, &ids, &n) == .success else { return [] }
         return ids.prefix(Int(n)).map { CGDisplayBounds($0) }
     }
-    static var union: CGRect { displays().reduce(CGRect.null) { $0.union($1) } }
-
-    /// The display touching the given outer edge of the desktop that is closest to `y`/`x` along it.
-    static func edgeDisplay(_ edge: ShareEdge) -> [CGRect] {
-        let u = union, ds = displays()
-        switch edge {
-        case .left: return ds.filter { $0.minX <= u.minX + 0.5 }
-        case .right: return ds.filter { $0.maxX >= u.maxX - 0.5 }
-        case .top: return ds.filter { $0.minY <= u.minY + 0.5 }
-        case .bottom: return ds.filter { $0.maxY >= u.maxY - 0.5 }
-        }
-    }
-
-    /// Is `p` on the outer `edge` of the desktop? Returns the position (0…1) along that edge's display.
-    static func hit(_ p: CGPoint, edge: ShareEdge) -> Float? {
-        for d in edgeDisplay(edge) where d.insetBy(dx: -1, dy: -1).contains(p) {
-            switch edge {
-            case .left where p.x <= d.minX + 0.5, .right where p.x >= d.maxX - 1:
-                return Float((p.y - d.minY) / max(d.height, 1))
-            case .top where p.y <= d.minY + 0.5, .bottom where p.y >= d.maxY - 1:
-                return Float((p.x - d.minX) / max(d.width, 1))
-            default: continue
-            }
-        }
-        return nil
-    }
-
-    /// A point just inside the outer `edge`, at `position` along the (tallest/widest) display on that edge.
-    static func entryPoint(_ edge: ShareEdge, position: Float) -> CGPoint {
-        let ds = edgeDisplay(edge)
-        guard let d = ds.max(by: { $0.width * $0.height < $1.width * $1.height }) else { return .zero }
-        let t = CGFloat(min(max(position, 0), 1))
-        switch edge {
-        case .left: return CGPoint(x: d.minX + 2, y: d.minY + t * (d.height - 1))
-        case .right: return CGPoint(x: d.maxX - 3, y: d.minY + t * (d.height - 1))
-        case .top: return CGPoint(x: d.minX + t * (d.width - 1), y: d.minY + 2)
-        case .bottom: return CGPoint(x: d.minX + t * (d.width - 1), y: d.maxY - 3)
-        }
-    }
 
     /// Clamp a point onto the desktop (handles displays of different sizes / gaps between them).
-    static func clamp(_ p: CGPoint) -> CGPoint {
-        let ds = displays()
+    static func clamp(_ p: CGPoint, within rects: [CGRect]? = nil) -> CGPoint {
+        let ds = rects ?? displays()
         if ds.contains(where: { $0.contains(p) }) { return p }
         var best = p, bestDist = CGFloat.greatestFiniteMagnitude
         for d in ds {
@@ -115,22 +73,64 @@ enum ShareScreens {
     }
 }
 
+/// Where the shared monitor sits among this Mac's displays. "Input follows the monitor": while the shared
+/// monitor shows the other computer, its area on this Mac's desktop IS the other computer.
+struct ShareLayout {
+    /// The shared monitor's bounds on this Mac — nil while this Mac's output to it is turned off
+    /// (then the crossing point is the edge of this Mac's own screens that faces where it was).
+    let shared: CGRect?
+    let others: [CGRect]        // this Mac's other displays (e.g. the MacBook screen); may be empty
+    let sharedOnRight: Bool
+    private var own: CGRect { others.reduce(CGRect.null) { $0.union($1) } }
+
+    /// The display a vertical position refers to: the shared monitor, or our display at the facing edge.
+    private var reference: CGRect {
+        if let s = shared { return s }
+        let edge = others.filter { sharedOnRight ? $0.maxX >= own.maxX - 0.5 : $0.minX <= own.minX + 0.5 }
+        return edge.max { $0.height < $1.height } ?? own
+    }
+
+    /// Does moving to `p` (by `dx`) mean "onto the other computer"?
+    func crossing(_ p: CGPoint, dx: CGFloat) -> Bool {
+        if let s = shared { return s.contains(p) }
+        return sharedOnRight ? (p.x >= own.maxX - 1 && dx > 0) : (p.x <= own.minX && dx < 0)
+    }
+
+    /// Position (0…1) down the shared monitor (or the facing display) for a point.
+    func position(_ p: CGPoint) -> Float {
+        let r = reference
+        return Float(min(max((p.y - r.minY) / max(r.height, 1), 0), 1))
+    }
+
+    /// A point on this Mac's own screens, just beside where the shared monitor is, at `position` down it.
+    func besideShared(_ position: Float) -> CGPoint {
+        let r = reference
+        let y = r.minY + CGFloat(min(max(position, 0), 1)) * (r.height - 1)
+        let x: CGFloat
+        if let s = shared { x = sharedOnRight ? s.minX - 3 : s.maxX + 2 }
+        else { x = sharedOnRight ? own.maxX - 4 : own.minX + 3 }
+        return ShareScreens.clamp(CGPoint(x: x, y: y), within: others.isEmpty ? shared.map { [$0] } : others)
+    }
+}
+
 // MARK: - Capture
 
 protocol ShareCaptureDelegate: AnyObject {
-    /// The local pointer reached the sharing edge; return true to start capturing (forwarding) input.
-    func captureEdgeHit(position: Float) -> Bool
+    /// The local pointer moved onto the shared monitor (which shows the other computer); true = start capturing.
+    func captureEnteredShared(position: Float) -> Bool
     func captured(_ msg: ShareMsg)
-    /// ⌃⌥⌘ + key pressed while capturing — handled locally, never forwarded (1/2/3/S, Esc = release).
+    /// ⌃⌥⌘ + key pressed while capturing — handled locally, never forwarded (1/2/3/S, Esc = take input back).
     func captureLocalHotkey(_ keyCode: UInt16)
 }
 
-/// One session-level event tap. Idle: watches for the pointer reaching the edge. Capturing: swallows all
-/// keyboard/mouse input and hands it to the delegate. Requires the Accessibility permission.
+/// One session-level event tap. Watching: notices the pointer moving onto the shared monitor while that
+/// monitor shows the other computer. Capturing: swallows all keyboard/mouse input and hands it to the
+/// delegate. Requires the Accessibility permission.
 final class ShareCapture {
     weak var delegate: ShareCaptureDelegate?
-    var edge: ShareEdge = .right
     var swapCmdCtrl = true
+    /// Set while the shared monitor shows the other computer and this Mac has other screens; nil = don't watch.
+    var watch: ShareLayout?
     private(set) var capturing = false
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
@@ -161,30 +161,28 @@ final class ShareCapture {
     }
 
     func stop() {
-        end(at: nil)
+        end(warpTo: nil)
         if let t = tap { CGEvent.tapEnable(tap: t, enable: false); CFMachPortInvalidate(t) }
         if let s = source { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
         tap = nil; source = nil
     }
 
-    func begin() {
+    /// Start forwarding everything. `parkAt`: where to hold this Mac's (hidden) pointer meanwhile.
+    func begin(parkAt: CGPoint?) {
         guard !capturing else { return }
         capturing = true
         lastFlags = CGEventSource.flagsState(.combinedSessionState).rawValue
         scrollRemainder = (0, 0)
+        if let p = parkAt { CGWarpMouseCursorPosition(p) }
         CGAssociateMouseAndMouseCursorPosition(0)      // pointer stays put; deltas keep coming
         ShareCursor.hide()
     }
 
-    /// Stop capturing; if `position` is given, put the local pointer just inside the sharing edge there.
-    func end(at position: Float?) {
+    func end(warpTo point: CGPoint?) {
         guard capturing else { return }
         capturing = false
         CGAssociateMouseAndMouseCursorPosition(1)
-        if let position {
-            let p = ShareScreens.entryPoint(edge, position: position)
-            CGWarpMouseCursorPosition(CGPoint(x: edge == .right ? p.x - 4 : edge == .left ? p.x + 4 : p.x, y: p.y))
-        }
+        if let point { CGWarpMouseCursorPosition(point) }
         ShareCursor.show()
     }
 
@@ -196,10 +194,10 @@ final class ShareCapture {
         if event.getIntegerValueField(.eventSourceUserData) == kShareInjectedTag { return Unmanaged.passUnretained(event) }
 
         guard capturing else {
-            if type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged,
-               let pos = ShareScreens.hit(event.location, edge: edge),
-               movingTowardEdge(event), delegate?.captureEdgeHit(position: pos) == true {
-                begin()
+            if let layout = watch,
+               type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged,
+               layout.crossing(event.location, dx: CGFloat(event.getIntegerValueField(.mouseEventDeltaX))),
+               delegate?.captureEnteredShared(position: layout.position(event.location)) == true {
                 return nil
             }
             return Unmanaged.passUnretained(event)
@@ -243,11 +241,6 @@ final class ShareCapture {
         return nil   // capturing: nothing reaches this Mac
     }
 
-    private func movingTowardEdge(_ e: CGEvent) -> Bool {
-        let dx = e.getIntegerValueField(.mouseEventDeltaX), dy = e.getIntegerValueField(.mouseEventDeltaY)
-        switch edge { case .right: return dx > 0; case .left: return dx < 0; case .bottom: return dy > 0; case .top: return dy < 0 }
-    }
-
     /// Wheel units: 120 per notch. Trackpads report pixels; ~40 px count as one notch.
     private func forwardScroll(_ e: CGEvent) {
         var x: Double, y: Double
@@ -285,9 +278,8 @@ enum ShareCursor {
 
 /// Replays the peer's input on this Mac. Every posted event is tagged so our capture ignores it.
 final class ShareEmulator {
-    var edge: ShareEdge = .right              // the edge facing the peer
     var swapCmdCtrl = true
-    /// The controlled pointer was pushed back out through `edge` — return control to the peer.
+    /// The controlled pointer moved onto the shared monitor (which shows the peer) — return control there.
     var onLeave: ((Float) -> Void)?
 
     private let source = CGEventSource(stateID: .privateState)
@@ -295,7 +287,7 @@ final class ShareEmulator {
     private var pressedButtons = Set<UInt8>()
     private var flags: UInt64 = 0
     private var lastClick: (button: UInt8, time: TimeInterval, count: Int64, at: CGPoint) = (0, 0, 0, .zero)
-    private var scrollRemainder: (x: Int, y: Int) = (0, 0)
+    private var leaveLayout: ShareLayout?        // nil = take-over: no hand-back by position
     private(set) var active = false
 
     private func post(_ e: CGEvent?) {
@@ -305,18 +297,30 @@ final class ShareEmulator {
     }
     private var cursor: CGPoint { CGEvent(source: nil)?.location ?? .zero }
 
-    func enter(position: Float) {
+    /// Start replaying. With a layout: the pointer appears beside the shared monitor at `position`, and moving
+    /// back onto the shared monitor hands control back. Without (take-over): the pointer stays where it is.
+    func enter(position: Float, layout: ShareLayout?) {
         active = true
-        let p = ShareScreens.entryPoint(edge, position: position)
-        CGWarpMouseCursorPosition(p)
-        post(CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left))
+        leaveLayout = layout
+        if let layout {
+            let p = layout.besideShared(position)
+            CGWarpMouseCursorPosition(p)
+            post(CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left))
+        }
     }
 
-    func leave() { releaseAll(); active = false }
+    func leave() { releaseAll(); active = false; leaveLayout = nil }
 
     func move(dx: Int16, dy: Int16) {
         guard active else { return }
-        let p = ShareScreens.clamp(CGPoint(x: cursor.x + CGFloat(dx), y: cursor.y + CGFloat(dy)))
+        let target = CGPoint(x: cursor.x + CGFloat(dx), y: cursor.y + CGFloat(dy))
+        if let l = leaveLayout, l.crossing(target, dx: CGFloat(dx)) {
+            let pos = l.position(target)
+            leave()
+            onLeave?(pos)
+            return
+        }
+        let p = ShareScreens.clamp(target, within: leaveLayout.map { $0.others.isEmpty ? ShareScreens.displays() : $0.others })
         let type: CGEventType = pressedButtons.contains(1) ? .leftMouseDragged
             : pressedButtons.contains(2) ? .rightMouseDragged
             : pressedButtons.isEmpty ? .mouseMoved : .otherMouseDragged
@@ -324,11 +328,6 @@ final class ShareEmulator {
         e?.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx))
         e?.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy))
         post(e)
-        let pushingOut = (edge == .right && dx > 0) || (edge == .left && dx < 0) || (edge == .bottom && dy > 0) || (edge == .top && dy < 0)
-        if pushingOut, let pos = ShareScreens.hit(p, edge: edge) {
-            leave()
-            onLeave?(pos)
-        }
     }
 
     func button(_ b: UInt8, down: Bool) {

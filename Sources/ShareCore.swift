@@ -216,6 +216,8 @@ enum ShareMsg: Equatable {
     case releaseAll
     case clipboard(String)
     case monitorPorts(mac: UInt8, other: UInt8)
+    case monitorShows(UInt8)
+    case switchRequest(UInt8)
     case unknown(UInt8)
 
     /// Messages that act on the receiving computer — only honoured from a paired peer.
@@ -242,6 +244,8 @@ enum ShareMsg: Equatable {
         case .releaseAll: w.u8(0x31)
         case .clipboard(let s): w.u8(0x40); w.bytes(Data(s.utf8).prefix(BHDS.maxClipboard))
         case .monitorPorts(let m, let o): w.u8(0x50); w.u8(m); w.u8(o)
+        case .monitorShows(let c): w.u8(0x51); w.u8(c)
+        case .switchRequest(let c): w.u8(0x52); w.u8(c)
         case .unknown(let t): w.u8(t)
         }
         return w.data
@@ -257,7 +261,7 @@ enum ShareMsg: Equatable {
         case 0x06: return .pairReject
         case 0x10, 0x11:
             let e = try r.u8(), p = try r.f32()
-            guard e <= 3, p.isFinite else { throw WireError.bad("bad edge") }
+            guard e <= 4, p.isFinite else { throw WireError.bad("bad edge") }   // 4 = take over, no edge
             let pos = min(max(p, 0), 1)
             return t == 0x10 ? .enter(edge: e, position: pos) : .leave(edge: e, position: pos)
         case 0x20: return .move(dx: try r.i16(), dy: try r.i16())
@@ -273,6 +277,8 @@ enum ShareMsg: Equatable {
             guard raw.count <= BHDS.maxClipboard else { throw WireError.bad("clipboard too large") }
             return .clipboard(String(decoding: raw, as: UTF8.self))
         case 0x50: return .monitorPorts(mac: try r.u8(), other: try r.u8())
+        case 0x51: return .monitorShows(try r.u8())
+        case 0x52: return .switchRequest(try r.u8())
         default: return .unknown(t)
         }
     }

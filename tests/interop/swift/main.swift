@@ -10,7 +10,7 @@ var got = 0
 func wire(_ s: ShareSession) {
     s.onReady = { s in
         print("CODE \(s.pairCode)"); print("PEER \(s.peer?.name ?? "?")")
-        s.send(.move(dx: 7, dy: -9)); s.send(.key(usage: 0xE3, down: true)); s.send(.clipboard("ঢাকা ✓ swift"))
+        s.send(.enter(edge: 4, position: 0.25)); s.send(.switchRequest(0x12)); s.send(.clipboard("ঢাকা ✓ swift"))
     }
     s.onMessage = { s, m in
         if m == .ping || m == .pong { return }

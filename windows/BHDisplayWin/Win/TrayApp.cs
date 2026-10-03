@@ -25,6 +25,8 @@ internal sealed class TrayApp : ApplicationContext
     private DateTime _lastPrompt = DateTime.MinValue;
     private bool _running, _controlling, _controlled;
     private uint _clipSeq;
+    private bool _showsPc;                                 // the shared monitor currently shows this PC
+    private bool _paused;                                  // Ctrl+Alt+Win+Esc: keep input here until the monitor changes
     private string _status = "Off";
     private readonly System.Windows.Forms.Timer _reconnect = new() { Interval = 5000 };
 
@@ -81,8 +83,64 @@ internal sealed class TrayApp : ApplicationContext
 
     private void Switch(byte code)
     {
+        // Going back to the Mac: let the Mac do it — it may have turned its output off while the monitor
+        // showed this PC, and must turn it on before the monitor switches (or the monitor sees no signal).
+        if (code == _settings.MacPort && _session is not null)
+        {
+            _session.Send(new ShareMsg.SwitchRequest(code));
+            Log.Write($"asked the Mac to switch the monitor to {Ddc.NameOf(code)}");
+            return;
+        }
         if (!Ddc.Switch(code))
+        {
             _icon.ShowBalloonTip(3000, "BHDisplay", "Couldn't switch the monitor. Turn on Setup Menu ▸ DDC/CI on the monitor.", ToolTipIcon.Warning);
+            return;
+        }
+        _session?.Send(new ShareMsg.MonitorShows(code));   // the Mac follows what the monitor shows
+        MonitorNowShows(code);
+    }
+
+    /// "Input follows the monitor": shows the Mac → this PC's input goes to the Mac (take-over);
+    /// shows this PC → keep input here, cross to the Mac at the edge facing it.
+    private void MonitorNowShows(byte code)
+    {
+        bool showsPc = code == _settings.PcPort;
+        if (showsPc != _showsPc) { _showsPc = showsPc; _paused = false; Log.Write($"monitor shows {(showsPc ? "this PC" : "the Mac")} ({Ddc.NameOf(code)})"); }
+        ApplyMode();
+    }
+
+    private void ApplyMode()
+    {
+        if (!_running) return;
+        _capture.WatchEdge = _showsPc;
+        if (_showsPc)
+        {
+            if (_controlling) StopControlling();            // visible again: Windows input belongs here
+        }
+        else
+        {
+            if (_controlled) { _emu.Leave(); _controlled = false; }
+            if (!_controlling && !_paused && _session is not null) StartTakeover();
+        }
+        UpdateStatus();
+    }
+
+    private void StartTakeover()
+    {
+        SendClipboardIfChanged();
+        _session!.Send(new ShareMsg.Enter(4, 0.5f));
+        _capture.Begin(0);
+        _controlling = true;
+        Log.Write("→ controlling the Mac (take-over: the monitor shows the Mac)");
+    }
+
+    private void StopControlling()
+    {
+        _session?.Send(new ShareMsg.ReleaseAll());
+        _session?.Send(new ShareMsg.Leave(4, 0.5f));
+        _capture.End(null);
+        _controlling = false;
+        Log.Write("← stopped controlling the Mac");
     }
 
     private void OnHotkey(int id)
@@ -101,7 +159,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         switch (hid)
         {
-            case 0x29: _session?.Send(new ShareMsg.ReleaseAll()); _capture.End(0.5f); _controlling = false; UpdateStatus(); break;   // Esc
+            case 0x29: _paused = true; StopControlling(); UpdateStatus(); break;   // Esc: take this PC's input back
             case 0x16: ToggleMonitor(); break;     // S
             case 0x1E: Switch(0x0F); break;        // 1
             case 0x1F: Switch(0x12); break;        // 2
@@ -248,6 +306,7 @@ internal sealed class TrayApp : ApplicationContext
             }
             _session = s;
             _settings.PeerHosts[fp] = s.RemoteHost; _settings.Save();
+            ApplyMode();
             UpdateStatus();
             return;
         }
@@ -303,10 +362,19 @@ internal sealed class TrayApp : ApplicationContext
         {
             case ShareMsg.Enter e:
                 if (_controlling) { _capture.End(null); _controlling = false; }
-                _emu.Enter(e.Position); _controlled = true; break;
+                if (e.Edge is 0 or 1 && e.Edge != _settings.MacEdge)
+                {   // the Mac tells us which of our edges faces it (from its display arrangement)
+                    _settings.MacEdge = e.Edge; _settings.Save(); _capture.Edge = _emu.Edge = e.Edge;
+                }
+                _emu.Enter(e.Position, takeover: e.Edge == 4); _controlled = true;
+                Log.Write($"← the Mac is controlling this PC ({(e.Edge == 4 ? "take-over" : "came across")})");
+                break;
             case ShareMsg.Leave l:
-                if (!_controlling) break;
-                _capture.End(l.Position); _controlling = false; break;
+                if (_controlling) { _capture.End(_showsPc ? l.Position : null); _controlling = false; Log.Write("← back on this PC"); }
+                else if (_controlled) { _emu.Leave(); _controlled = false; Log.Write("the Mac stopped controlling this PC"); }
+                break;
+            case ShareMsg.MonitorShows ms when Ddc.IsInput(ms.Code):
+                MonitorNowShows(ms.Code); break;
             case ShareMsg.Move mv: if (_controlled) _emu.Move(mv.Dx, mv.Dy); break;
             case ShareMsg.Button b: if (_controlled) _emu.Button(b.Number, b.Down); break;
             case ShareMsg.Scroll sc: if (_controlled) _emu.Scroll(sc.Dx, sc.Dy); break;
@@ -314,7 +382,7 @@ internal sealed class TrayApp : ApplicationContext
             case ShareMsg.ReleaseAll: _emu.ReleaseAll(); break;
             case ShareMsg.Clipboard c: ApplyClipboard(c.Text); break;
             case ShareMsg.MonitorPorts p when Ddc.IsInput(p.Mac) && Ddc.IsInput(p.Other) && p.Mac != p.Other:
-                _settings.MacPort = p.Mac; _settings.PcPort = p.Other; _settings.Save(); break;
+                _settings.MacPort = p.Mac; _settings.PcPort = p.Other; _settings.Save(); ApplyMode(); break;
         }
         UpdateStatus();
     }
@@ -323,8 +391,9 @@ internal sealed class TrayApp : ApplicationContext
 
     private bool EdgeHit(float pos)
     {
-        if (!_running || _session is null || _controlled) return false;
+        if (!_running || _session is null || _controlled || !_showsPc) return false;
         SendClipboardIfChanged();
+        Log.Write("→ controlling the Mac (pointer crossed the edge)");
         _session.Send(new ShareMsg.Enter((byte)(1 - _settings.MacEdge), pos));   // enters the Mac's facing edge
         _controlling = true;
         UpdateStatus();
@@ -335,6 +404,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (!_controlled || _session is null) return;
         _controlled = false;
+        Log.Write("→ pointer reached the edge: back to the Mac");
         SendClipboardIfChanged();
         _session.Send(new ShareMsg.Leave((byte)_settings.MacEdge, pos));
         UpdateStatus();
@@ -368,7 +438,7 @@ internal sealed class TrayApp : ApplicationContext
         {
             var peer = _session?.Peer?.Name;
             _status = peer is not null
-                ? _controlling ? $"Typing on {peer}" : _controlled ? $"{peer} is typing on this PC" : $"Connected to {peer}"
+                ? _controlling ? $"Typing on {peer} — Ctrl+Alt+Win+Esc takes it back" : _controlled ? $"{peer}'s keyboard & mouse are on this PC" : $"Connected to {peer}"
                 : _settings.Paired.Count == 0
                     ? (_unpaired.Count == 0 ? "Looking for BHDisplay on your Mac…" : "Found a computer — pair it from this menu")
                     : $"Waiting for {string.Join(", ", _settings.Paired.Values)}…";
@@ -413,10 +483,6 @@ internal sealed class TrayApp : ApplicationContext
                     _settings.Paired.Remove(fp); _settings.PeerHosts.Remove(fp); _settings.Save();
                     if (_session is { } s && P256.Hex(s.PeerFingerprint) == fp) s.Close("forgotten");
                 }));
-            var side = new ToolStripMenuItem("    The Mac is on the");
-            side.DropDownItems.Add(new ToolStripMenuItem("Left", null, (_, _) => SetSide(0)) { Checked = _settings.MacEdge == 0 });
-            side.DropDownItems.Add(new ToolStripMenuItem("Right", null, (_, _) => SetSide(1)) { Checked = _settings.MacEdge == 1 });
-            _menu.Items.Add(side);
         }
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(new ToolStripMenuItem("Start with Windows", null, (_, _) => SetStartWithWindows(!StartsWithWindows())) { Checked = StartsWithWindows() });

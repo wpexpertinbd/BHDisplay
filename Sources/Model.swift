@@ -70,6 +70,22 @@ final class DDCWorker {
         return ddc
     }
 
+    /// Forget the cached monitor connection (it goes away while the Mac's output is off, and comes back new).
+    func reset() { q.async { self.ddc = nil } }
+
+    /// After the display is turned back on: wait (off the main thread) until the monitor answers DDC again.
+    func waitForMonitor(timeout: TimeInterval, done: @escaping (Bool) -> Void) {
+        q.async {
+            self.ddc = nil
+            let end = Date().addingTimeInterval(timeout)
+            while Date() < end {
+                if let d = DDC.firstExternal(), (try? d.read(VCP.input)) != nil { self.ddc = d; DispatchQueue.main.async { done(true) }; return }
+                usleep(300_000)
+            }
+            DispatchQueue.main.async { done(false) }
+        }
+    }
+
     func set(_ code: UInt8, _ value: UInt16, repeats: Int = 1, delay: Double = 0.05) {
         lock.lock()
         if pending[code] == nil { order.append(code) }
@@ -186,7 +202,7 @@ final class MonitorModel: ObservableObject {
     }
 
     func refresh(full: Bool = true) {
-        guard !loading else { return }
+        guard !loading, !macDisplayOff else { return }    // no DDC path while our output is off
         loading = true
         let started = Date()
         let codes: [UInt8] = full
@@ -202,7 +218,12 @@ final class MonitorModel: ObservableObject {
             var v = v
             for (c, t) in self.lastLocalChange where t > started { v[c] = nil }
             func d(_ c: UInt8) -> Double? { v[c].map { Double($0.current) } }
-            if let x = v[VCP.input] { self.input = x.current & 0xFF }
+            if let x = v[VCP.input] {
+                let before = self.input
+                self.input = x.current & 0xFF
+                // Switched with the monitor's own buttons / Auto Detect: same turn-off rule as our own switches.
+                if before != self.input, let now = self.input, now != self.macInput { self.scheduleTurnOff(for: now) }
+            }
             if let x = d(VCP.brightness) { self.brightness = x }
             if let x = d(VCP.contrast) { self.contrast = x }
             if let x = d(VCP.sharpness) { self.sharpness = x }
@@ -239,8 +260,33 @@ final class MonitorModel: ObservableObject {
     // must not overwrite the newer state.
     private var switchGen = 0, blueGen = 0, autoGen = 0
 
+    /// While the monitor shows the other computer, turn this Mac's output to it off (single-screen MacBook).
+    @Published var turnOffWhenOther: Bool = UserDefaults.standard.object(forKey: "turnOffWhenOther") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(turnOffWhenOther, forKey: "turnOffWhenOther")
+            if !turnOffWhenOther { turnSharedDisplayOn() } else if let i = input, i != macInput { scheduleTurnOff(for: i) }
+        }
+    }
+    @Published private(set) var macDisplayOff = false
+    private var turnOffCheck: DispatchWorkItem?
+
     func switchTo(_ code: UInt16) {
         guard MonitorInput.isValid(code) else { return }
+        // Switching back to this Mac while its output is off: turn it on FIRST and wait until the monitor
+        // answers again — otherwise the monitor sees no signal on our input and Auto Detect bounces away.
+        if code == macInput, macDisplayOff {
+            turnSharedDisplayOn()
+            notice = nil
+            io.waitForMonitor(timeout: 6) { [weak self] ok in
+                guard let self else { return }
+                if ok { self.performSwitch(code) } else { self.error = "The monitor didn't come back — try again" }
+            }
+            return
+        }
+        performSwitch(code)
+    }
+
+    private func performSwitch(_ code: UInt16) {
         switchGen += 1
         let gen = switchGen
         if let cur = input, MonitorInput.isValid(cur), cur != code, cur != macInput { otherInput = cur }
@@ -261,6 +307,46 @@ final class MonitorModel: ObservableObject {
         }
         bounceCheck = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
+        if code != macInput { scheduleTurnOff(for: code) }
+    }
+
+    /// Turn the Mac's output off only once the monitor has STAYED on the other computer — never on a bounce
+    /// (if the other computer is asleep, Auto Detect comes back to us and the display must stay on).
+    func scheduleTurnOff(for code: UInt16) {
+        turnOffCheck?.cancel()
+        guard turnOffWhenOther, DisplayPower.available, !macDisplayOff else { return }
+        let gen = switchGen
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, gen == self.switchGen else { return }
+            self.io.read([VCP.input], info: false) { r, _, _ in
+                guard gen == self.switchGen, self.turnOffWhenOther, let now = r[VCP.input]?.current, now & 0xFF == code,
+                      code != self.macInput, let id = self.info.displayID else { return }
+                if DisplayPower.turnOff(id) {
+                    self.macDisplayOff = true
+                    self.io.reset()
+                }
+            }
+        }
+        turnOffCheck = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
+    }
+
+    func turnSharedDisplayOn() {
+        turnOffCheck?.cancel()
+        guard macDisplayOff else { return }
+        DisplayPower.turnOn()
+        macDisplayOff = false
+        io.reset()
+    }
+
+    /// The other computer switched the monitor itself and told us: reflect it without sending a command.
+    func adoptInput(_ code: UInt16) {
+        guard MonitorInput.isValid(code) else { return }
+        switchGen += 1                        // supersede any pending re-check of an older switch
+        input = code
+        notice = nil
+        if code == macInput { turnSharedDisplayOn() }      // self-heal: the monitor is on us, so we must output
+        else { scheduleTurnOff(for: code) }
     }
 
     /// One-key flip between this Mac and the other computer.

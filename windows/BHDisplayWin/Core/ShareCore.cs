@@ -224,6 +224,8 @@ public abstract record ShareMsg
     public sealed record ReleaseAll : ShareMsg;
     public sealed record Clipboard(string Text) : ShareMsg;
     public sealed record MonitorPorts(byte Mac, byte Other) : ShareMsg;
+    public sealed record MonitorShows(byte Code) : ShareMsg;
+    public sealed record SwitchRequest(byte Code) : ShareMsg;
     public sealed record Unknown(byte Type) : ShareMsg;
 
     /// Messages that act on the receiving computer — only honoured from a paired peer.
@@ -251,6 +253,8 @@ public abstract record ShareMsg
                 w.Bytes(t.Length > Bhds.MaxClipboard ? t.AsSpan(0, Bhds.MaxClipboard) : t);
                 break;
             case MonitorPorts p: w.U8(0x50); w.U8(p.Mac); w.U8(p.Other); break;
+            case MonitorShows m: w.U8(0x51); w.U8(m.Code); break;
+            case SwitchRequest q: w.U8(0x52); w.U8(q.Code); break;
             case Unknown u: w.U8(u.Type); break;
         }
         return w.ToArray();
@@ -269,7 +273,7 @@ public abstract record ShareMsg
             case 0x10 or 0x11:
             {
                 var e = r.U8(); var p = r.F32();
-                if (e > 3 || !float.IsFinite(p)) throw new WireException("bad edge");
+                if (e > 4 || !float.IsFinite(p)) throw new WireException("bad edge");   // 4 = take over, no edge
                 p = Math.Clamp(p, 0f, 1f);
                 return t == 0x10 ? new Enter(e, p) : new Leave(e, p);
             }
@@ -290,6 +294,8 @@ public abstract record ShareMsg
                 return new Clipboard(Encoding.UTF8.GetString(raw));
             }
             case 0x50: return new MonitorPorts(r.U8(), r.U8());
+            case 0x51: return new MonitorShows(r.U8());
+            case 0x52: return new SwitchRequest(r.U8());
             default: return new Unknown(t);
         }
     }

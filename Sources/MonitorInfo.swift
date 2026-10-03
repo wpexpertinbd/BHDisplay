@@ -15,6 +15,7 @@ struct MonitorInfo {
     var mccs = "—"
     var matchedDDC = false       // true when this info belongs to the display DDC talks to
     var externalCount = 1
+    var displayID: CGDirectDisplayID?   // the CoreGraphics display that IS this monitor (for keyboard & mouse sharing)
 
     /// `identity` comes from the DDC channel's own EDID read; only the framebuffer with the same
     /// manufacturer/product is described, so the window never shows one monitor while driving another.
@@ -45,21 +46,25 @@ struct MonitorInfo {
                 break
             }
         }
-        info.resolution = nativeMode(identity: identity) ?? "—"
+        info.displayID = displayID(identity: identity)
+        info.resolution = info.displayID.flatMap(nativeMode) ?? "—"
         return info
     }
 
-    /// The panel's native mode (EDID preferred timing) at its highest refresh rate.
-    private static func nativeMode(identity: MonitorIdentity?) -> String? {
+    /// The CG display matching the DDC identity (CGDisplayVendorNumber/ModelNumber carry the same EDID values).
+    static func displayID(identity: MonitorIdentity?) -> CGDirectDisplayID? {
         var ids = [CGDirectDisplayID](repeating: 0, count: 8)
         var n: UInt32 = 0
         guard CGGetOnlineDisplayList(8, &ids, &n) == .success else { return nil }
-        // CGDisplayVendorNumber/ModelNumber carry the same EDID manufacturer/product as the DDC identity.
-        guard let ext = ids.prefix(Int(n)).first(where: { id in
+        return ids.prefix(Int(n)).first(where: { id in
             CGDisplayIsBuiltin(id) == 0 && (identity.map {
                 CGDisplayVendorNumber(id) == UInt32($0.manufacturer) && CGDisplayModelNumber(id) == UInt32($0.product)
             } ?? true)
-        }) else { return nil }
+        })
+    }
+
+    /// The panel's native mode (EDID preferred timing) at its highest refresh rate.
+    private static func nativeMode(_ ext: CGDirectDisplayID) -> String? {
         let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
         guard let modes = CGDisplayCopyAllDisplayModes(ext, opts) as? [CGDisplayMode], !modes.isEmpty else { return nil }
         let native = modes.filter { $0.ioFlags & UInt32(kDisplayModeNativeFlag) != 0 }
