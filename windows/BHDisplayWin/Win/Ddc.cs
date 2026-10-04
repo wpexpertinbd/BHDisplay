@@ -157,6 +157,7 @@ internal sealed class Settings
     public byte PcPort { get; set; } = 0x0F;
     public string SharedMonitorSerial { get; set; } = "";   // which of several monitors is also on the Mac
     public bool Logging { get; set; } = true;               // "Keep a Log"
+    public int LogKeepDays { get; set; } = 7;               // delete log entries older than 3 or 7 days
     public bool TurnOffWhenMac { get; set; } = true;      // turn Windows' output to the shared monitor off while it shows the Mac
     public string DetachedDevice { get; set; } = "";
     public string RestorePrimary { get; set; } = "";       // was the main display before we turned it off       // set while we have it off (restored at start if we crashed)

@@ -681,8 +681,31 @@ enum ShareLog {
         if !FileManager.default.fileExists(atPath: url.path) { write("log opened") }
         NSWorkspace.shared.open(url)
     }
+    /// "Delete log entries older than" (menu): 3 or 7 days, 7 by default.
+    static var keepDays: Int {
+        get { let d = UserDefaults.standard.integer(forKey: "logKeepDays"); return d == 3 ? 3 : 7 }
+        set { UserDefaults.standard.set(newValue == 3 ? 3 : 7, forKey: "logKeepDays"); prune(force: true) }
+    }
+    private static var lastPrune = Date.distantPast
+    /// Drops lines older than `keepDays` (lines are "yyyy-MM-dd HH:mm:ss …"). At most hourly unless forced.
+    static func prune(force: Bool = false) {
+        guard force || Date().timeIntervalSince(lastPrune) > 3600 else { return }
+        lastPrune = Date()
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        let cutoff = fmt.string(from: Date().addingTimeInterval(-Double(keepDays) * 86400))
+        var keep = false
+        let kept = text.split(separator: "\n", omittingEmptySubsequences: false).filter { line in
+            // A dated line decides; undated lines (continuations) follow the line before them.
+            if line.count >= 19, line.prefix(4).allSatisfy(\.isNumber) { keep = String(line.prefix(19)) >= cutoff }
+            return keep || line.isEmpty
+        }
+        let out = kept.joined(separator: "\n")
+        if out.count != text.count { try? out.write(to: url, atomically: true, encoding: .utf8) }
+    }
+
     static func write(_ line: String) {
         guard enabled else { return }
+        prune()
         let u = url
         try? FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let size = (try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? Int, size > 256 * 1024 {

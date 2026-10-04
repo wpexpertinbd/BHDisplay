@@ -857,6 +857,13 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
             Changed?.Invoke();
         }) { Checked = _settings.Logging });
         _menu.Items.Add(new ToolStripMenuItem("Check Log", null, (_, _) => OpenLog()) { Enabled = _settings.Logging });
+        var age = new ToolStripMenuItem("Delete Log Entries Older Than") { Enabled = _settings.Logging };
+        foreach (var d in new[] { 3, 7 })
+            age.DropDownItems.Add(new ToolStripMenuItem($"{d} Days", null, (_, _) =>
+            {
+                _settings.LogKeepDays = d; _settings.Save(); Log.KeepDays = d; Log.Prune(force: true);
+            }) { Checked = (_settings.LogKeepDays == 3 ? 3 : 7) == d });
+        _menu.Items.Add(age);
         _menu.Items.Add(new ToolStripMenuItem("About BHDisplay", null, (_, _) => MessageBox.Show(
             $"BHDisplay for Windows {Application.ProductVersion}\n\nBuilt by BiswasHost — www.biswashost.com\nFree & open-source: github.com/wpexpertinbd/BHDisplay\n\n" +
             "Not affiliated with or endorsed by ViewSonic.", "About BHDisplay")));

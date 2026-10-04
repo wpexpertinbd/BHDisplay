@@ -216,6 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         status.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         registerHotKeys()
         LegacyCleanup.removeOldSharingJob()
+        ShareLog.prune(force: true)             // old entries go at every start too
         ShareController.shared.bootstrap()
         m.refresh()
         // Re-read when the monitor is plugged/unplugged or wakes.
@@ -294,6 +295,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let check = NSMenuItem(title: "Check Log…", action: ShareLog.enabled ? #selector(checkLog) : nil, keyEquivalent: ""); check.target = self
         check.isEnabled = ShareLog.enabled
         menu.addItem(check)
+        let age = NSMenuItem(title: "Delete Log Entries Older Than", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for d in [3, 7] {
+            let i = NSMenuItem(title: "\(d) Days", action: #selector(setLogDays(_:)), keyEquivalent: ""); i.target = self
+            i.tag = d; i.state = ShareLog.keepDays == d ? .on : .off
+            sub.addItem(i)
+        }
+        age.submenu = sub; age.isEnabled = ShareLog.enabled
+        menu.addItem(age)
         menu.addItem(.separator())
         let ab = NSMenuItem(title: "About BHDisplay", action: #selector(showAbout), keyEquivalent: ""); ab.target = self
         menu.addItem(ab)
@@ -340,6 +350,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         else { ShareLog.enabled = true; ShareLog.write("log turned on") }
     }
     @objc private func checkLog() { ShareLog.open() }
+    @objc private func setLogDays(_ item: NSMenuItem) { ShareLog.keepDays = item.tag }
     @objc private func pairDevice(_ item: NSMenuItem) {
         let share = ShareController.shared
         if let id = item.representedObject as? String, let d = share.discovered.first(where: { $0.id == id }) { share.pair(with: d) }

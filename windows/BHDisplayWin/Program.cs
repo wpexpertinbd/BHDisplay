@@ -12,7 +12,10 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
-        Log.Enabled = Settings.Load().Logging;          // respect "Keep a Log" from the first line
+        var startSettings = Settings.Load();
+        Log.Enabled = startSettings.Logging;          // respect "Keep a Log" from the first line
+        Log.KeepDays = startSettings.LogKeepDays == 3 ? 3 : 7;
+        Log.Prune(force: true);
         Log.Write($"start {Application.ProductVersion} on {Environment.OSVersion} from {Application.ExecutablePath}");
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => Fatal(e.Exception);
@@ -72,9 +75,40 @@ internal static class Log
     private static readonly object Gate = new();
     /// "Keep a Log" (tray menu). Crash reports are written even when it is off.
     public static volatile bool Enabled = true;
+    /// "Delete log entries older than": 3 or 7 days.
+    public static volatile int KeepDays = 7;
+    private static long _lastPrune = long.MinValue / 2;
+
+    /// Drops lines older than KeepDays (lines are "yyyy-MM-dd HH:mm:ss …"). At most hourly unless forced.
+    public static void Prune(bool force = false)
+    {
+        try
+        {
+            lock (Gate)
+            {
+                long now = Environment.TickCount;
+                if (!force && now - _lastPrune < 3_600_000 && now - _lastPrune >= 0) return;
+                _lastPrune = now;
+                if (!File.Exists(FilePath)) return;
+                var cutoff = DateTime.Now.AddDays(-KeepDays).ToString("yyyy-MM-dd HH:mm:ss");
+                var lines = File.ReadAllLines(FilePath);
+                bool keep = false;
+                var kept = lines.Where(l =>
+                {
+                    // A dated line decides; undated lines (stack traces) follow the line before them.
+                    if (l.Length >= 19 && l.Take(4).All(char.IsDigit)) keep = string.CompareOrdinal(l.Substring(0, 19), cutoff) >= 0;
+                    return keep;
+                }).ToArray();
+                if (kept.Length != lines.Length) File.WriteAllLines(FilePath, kept);
+            }
+        }
+        catch { }
+    }
+
     public static void Write(string line)
     {
         if (!Enabled && !line.StartsWith("FATAL", StringComparison.Ordinal)) return;
+        Prune();
         try
         {
             lock (Gate)
