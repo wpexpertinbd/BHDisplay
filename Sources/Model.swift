@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import SwiftUI
 import AppKit
+import IOKit.pwr_mgt
 
 /// VCP codes used by the app. Standard MCCS codes are confirmed from the XG2409A capabilities string.
 enum VCP {
@@ -320,16 +321,40 @@ final class MonitorModel: ObservableObject {
         // Switching back to this Mac while its output is off: turn it on FIRST and wait until the monitor
         // answers again — otherwise the monitor sees no signal on our input and Auto Detect bounces away.
         // Also when the monitor was replugged while our output to it was off: macOS kept it off under a new ID.
-        if code == macInput, macDisplayOff || DisplayPower.reenableRemembered() {
+        // Also while this Mac's screens sleep (locked, idle): its HDMI output gives no picture until they wake, so the
+        // monitor would see nothing on our input and Auto Detect would go straight back (2026-10-05 00:37 "no picture").
+        if code == macInput, macDisplayOff || DisplayPower.reenableRemembered() || CGDisplayIsAsleep(CGMainDisplayID()) != 0 {
+            IOPMAssertionDeclareUserActivity("BHDisplay: switching the monitor to this Mac" as CFString, kIOPMUserActiveLocal, &wakeID)
             turnSharedDisplayOn()
             notice = nil
+            let gen = switchGen
             io.waitForMonitor(timeout: 6) { [weak self] ok in
                 guard let self else { return }
-                if ok { self.performSwitch(code) } else { self.error = "The monitor didn't come back — try again" }
+                guard ok else { self.error = "The monitor didn't come back — try again"; return }
+                self.waitForPicture { [weak self] in
+                    guard let self, gen == self.switchGen else { return }     // a newer choice was made meanwhile
+                    self.performSwitch(code)
+                }
             }
             return
         }
         performSwitch(code)
+    }
+
+    private var wakeID: IOPMAssertionID = 0
+
+    /// Until this Mac's screens are awake and the monitor is one of them, plus a moment for the HDMI link to give a
+    /// picture (at most ~10 s; switches anyway after that).
+    private func waitForPicture(_ done: @escaping @MainActor @Sendable () -> Void) {
+        waitForPicture(until: Date().addingTimeInterval(10), done)
+    }
+    private func waitForPicture(until end: Date, _ done: @escaping @MainActor @Sendable () -> Void) {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16); var n: UInt32 = 0
+        let ready = CGDisplayIsAsleep(CGMainDisplayID()) == 0 && CGGetActiveDisplayList(16, &ids, &n) == .success
+            && ids.prefix(Int(n)).contains { CGDisplayIsBuiltin($0) == 0 }
+        if ready { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { done() }; return }
+        if Date() > end { done(); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.waitForPicture(until: end, done) }
     }
 
     private func performSwitch(_ code: UInt16) {
@@ -348,8 +373,11 @@ final class MonitorModel: ObservableObject {
                 self.input = now & 0xFF
                 if now & 0xFF != code { self.realSwitch.send(now & 0xFF) }       // bounced: tell the other computer
                 if now & 0xFF != code {
-                    self.notice = "\(MonitorInput.name(for: code)) has no picture — the computer on it is asleep or off, so the monitor's Auto Detect went back to \(MonitorInput.name(for: now)). Turn Auto Detect off to stay on it."
+                    let text = "\(MonitorInput.name(for: code)) has no picture — the computer on it is asleep or off, so the monitor's Auto Detect went back to \(MonitorInput.name(for: now)). Turn Auto Detect off to stay on it."
+                    self.notice = text
                     NSSound.beep()
+                    // An old warning must not linger (2026-10-05: still shown while Windows was in use long after).
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in if self?.notice == text { self?.notice = nil } }
                 }
             }
         }
