@@ -67,6 +67,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         capture.delegate = self
         capture.swapCmdCtrl = swapCmdCtrl; emulator.swapCmdCtrl = swapCmdCtrl; emulator.speed = peerMouseSpeed; emulator.scrollSpeed = peerScrollSpeed
         emulator.onLeave = { [weak self] pos in MainActor.assumeIsolated { self?.peerPointerLeft(position: pos) } }
+        emulator.currentLayout = { [weak self] in
+            MainActor.assumeIsolated { guard let self else { return nil }; return self.showsPeer ? (self.layout() ?? self.outerLayout()) : self.outerLayout() }
+        }
     }
 
     func bootstrap() { if enabled { start() } }

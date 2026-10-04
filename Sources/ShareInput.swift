@@ -324,6 +324,11 @@ final class ShareEmulator {
     }
     /// The controlled pointer moved onto the shared monitor (which shows the peer) — return control there.
     var onLeave: ((Float) -> Void)?
+    /// Where the hand-back edge is NOW. The screens can change while the peer controls this Mac: a sleeping display is
+    /// not "active", so a pointer that arrived while the Mac was locked and dark got an empty layout and could never
+    /// leave again (2026-10-05 04:50, until sharing was turned off and on).
+    var currentLayout: (() -> ShareLayout?)?
+    private var layoutCheckedAt: TimeInterval = 0
 
     private let source = CGEventSource(stateID: .privateState)
     private var pressedKeys = Set<UInt16>()      // mac key codes
@@ -358,6 +363,11 @@ final class ShareEmulator {
         guard active else { return }
         let d = accelerated(dx, dy)
         let target = CGPoint(x: cursor.x + d.x, y: cursor.y + d.y)
+        let now = ProcessInfo.processInfo.systemUptime
+        if leaveLayout != nil, now - layoutCheckedAt > 0.25, let fresh = currentLayout?() {
+            layoutCheckedAt = now
+            leaveLayout = fresh
+        }
         if let l = leaveLayout, l.crossing(target, dx: CGFloat(dx)) {
             let pos = l.position(target)
             leave()
