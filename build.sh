@@ -7,8 +7,8 @@ cd "${0:A:h}"
 
 NAME=BHDisplay
 BUNDLE_ID=com.biswashost.bhdisplay
-VERSION=1.3.1
-BUILD_NUM=9
+VERSION=1.3.2
+BUILD_NUM=10
 # ".noindex" keeps Spotlight/Launchpad from listing this development copy next to the installed app.
 APP=build.noindex/$NAME.app
 

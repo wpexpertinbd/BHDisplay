@@ -236,6 +236,13 @@ final class MonitorModel: ObservableObject {
                     self.macSeenWhileOff += 1
                     if self.macSeenWhileOff >= 2 { self.macSeenWhileOff = 0; self.turnSharedDisplayOn(); return }
                 } else { self.macSeenWhileOff = 0 }
+                if self.turnOffAfterRead {
+                    self.turnOffAfterRead = false
+                    if let now = self.input {
+                        self.realSwitch.send(now)        // the other computer learns the real state after a (re)connect
+                        if now != self.macInput { self.scheduleTurnOff(for: now) }
+                    }
+                }
             }
             if let x = d(VCP.brightness) { self.brightness = x }
             if let x = d(VCP.contrast) { self.contrast = x }
@@ -365,9 +372,12 @@ final class MonitorModel: ObservableObject {
 
     /// Connected again: re-read what the monitor shows and apply the same rules as before.
     func connectionBack() {
+        // Right after a start the input isn't known yet: decide once the next read arrives (2026-10-04 22:32: after a
+        // restart the Mac never turned its output off, so the monitor later vanished from the Mac when its display slept).
+        turnOffAfterRead = true
         refresh(full: false)
-        if let i = input, i != macInput { scheduleTurnOff(for: i) }
     }
+    private var turnOffAfterRead = false
 
     /// Disconnected: a turn-off that was waiting must not happen without the other computer.
     func cancelTurnOff() { turnOffCheck?.cancel(); turnOffCheck = nil }

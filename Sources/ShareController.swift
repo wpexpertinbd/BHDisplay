@@ -192,7 +192,12 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             _ = off
             return ShareLayout(shared: nil, others: ShareScreens.displays(), sharedOnRight: lastSharedOnRight)
         }
-        guard let id = MonitorModel.shared.info.displayID ?? MonitorInfo.displayID(identity: nil), DisplayPower.isActive(id) else { return nil }
+        // The shared monitor is not one of our screens right now (2026-10-04: after the Mac's display slept while the
+        // monitor showed Windows, macOS dropped it) — same as turned off: cross at the edge of our screens that faced it.
+        // Returning nil here left the other computer's pointer stuck on the Mac and the Mac's pointer unable to cross.
+        guard let id = MonitorModel.shared.info.displayID ?? MonitorInfo.displayID(identity: nil), DisplayPower.isActive(id) else {
+            return ShareLayout(shared: nil, others: ShareScreens.displays(), sharedOnRight: lastSharedOnRight)
+        }
         let shared = CGDisplayBounds(id)
         let others = ShareScreens.displays().filter { $0 != shared }
         let own = others.reduce(CGRect.null) { $0.union($1) }
