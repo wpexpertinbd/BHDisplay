@@ -9,7 +9,7 @@ Free, open-source apps by **BiswasHost** for a monitor shared between a Mac and 
   volume, View Mode and colour temperature — without touching its buttons.
 - **Share keyboard & mouse both ways** — use the Mac's keyboard and trackpad on the PC, or the
   PC's keyboard and mouse on the Mac, with copy & paste of text between them. Encrypted, paired,
-  local network only.
+  local network only. **Two Windows PCs** can share one keyboard & mouse the same way.
 
 A working alternative to ViewSonic's vDisplay Manager on modern macOS, plus the keyboard & mouse
 sharing it never had. 100% open-source.
@@ -104,6 +104,18 @@ switches the monitor; that stays a menu or shortcut action.
 From then on they reconnect by themselves. Nothing can pair without someone choosing
 *Pair a new computer…* on that computer first.
 
+**Connection lost** (a computer turned off, asleep, a cable or Wi-Fi gone)? After 10 seconds both computers
+go back to normal, exactly as if they had never been connected — every screen on, each keyboard and mouse at home.
+When the other computer comes back, they reconnect and pick up the setup by themselves.
+
+### 🪟⇄🪟 Two Windows PCs
+
+The same Windows app shares a keyboard & mouse between **two Windows PCs** (e.g. two laptops side by side).
+Install it on both and pair them as above (**Pair a new computer…** on one, **Pair with…** on the other). Then
+open the window on each and choose **"The other computer is on my left / right"** in the *Keyboard & Mouse*
+card, so the pointer crosses at the right edge. Each PC keeps its own monitors — they never switch or turn off
+each other's screens.
+
 | Shortcut | Mac | Windows |
 |----------|-----|---------|
 | Monitor: Mac ⇄ other computer | **⌃⌥⌘S** | **Ctrl+Alt+Win+S** |
@@ -174,10 +186,10 @@ already part of Windows, so there is nothing else to install).
    contrast, sharpness, blue light filter, volume, View Mode, colour temperature, monitor information
    and keyboard & mouse sharing. **Right-click** for the quick menu.
    If Windows asks whether BHDisplay may use the network, allow **Private networks**.
-4. **More than one monitor on the PC?** Pick a monitor at the top of the window to adjust *that* one
+4. **More than one screen on the PC?** Pick a monitor at the top of the window to adjust *that* one
    (**Identify** shows which is which), and tick **"This is the monitor connected to the Mac"** on the one
    your Mac shares — the shortcuts and keyboard sharing always use that monitor.
-   While that monitor shows the Mac, Windows **turns its output to it off** (and makes your other screen the main
+   Once ticked, while that monitor shows the Mac, Windows **turns its output to it off** (and makes your other screen the main
    display), so apps never open on a screen you can't see. Switching back to the PC turns it on again first and
    gives the main display back — your arrangement returns exactly as it was.
 
@@ -240,8 +252,8 @@ cd windows/BHDisplayWin && dotnet publish -c Release -o ../dist   # → windows/
 ```
 
 Tests: `tests/sharecore` and `tests/sharenet` (Swift), `tests/gcm` (the Windows encryption against
-NIST/RFC test vectors and .NET's own), and `tests/interop/run.sh` (Mac ⇄ Windows handshake and
-messages, both directions).
+NIST/RFC test vectors and .NET's own), and `tests/interop/run.sh` (Mac ⇄ Windows and
+Windows ⇄ Windows handshake and messages).
 
 ```
 Sources/DDC.swift          DDC/CI transport over the Apple Silicon display controller (DCP)

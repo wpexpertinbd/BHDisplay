@@ -45,6 +45,7 @@ enum DisplayPower {
             && Int(CGDisplayVendorNumber(id)) == vendor && Int(CGDisplayModelNumber(id)) == model {
             if apply({ fn($0, id, true) }) { turnedOn = true }
         }
+        if turnedOn { forgetRemembered() }
         return turnedOn
     }
 
@@ -81,7 +82,15 @@ enum DisplayPower {
         guard let fn = enableFn, let id = disabledID else { return true }
         guard apply({ fn($0, id, true) }) else { return false }
         disabledID = nil
+        // Back on: forget the model, so a twin monitor someone turned off on purpose is never touched later.
+        // Not active (replugged while off → a new ID): find it by model instead.
+        if isActive(id) { forgetRemembered() } else { reenableRemembered() }
         return true
+    }
+
+    private static func forgetRemembered() {
+        UserDefaults.standard.removeObject(forKey: "displayTurnedOffVendor")
+        UserDefaults.standard.removeObject(forKey: "displayTurnedOffModel")
     }
 
     private static func apply(_ body: (CGDisplayConfigRef?) -> CGError) -> Bool {

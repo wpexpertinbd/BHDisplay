@@ -47,7 +47,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
     private var promptOpen = false                      // never stack pairing prompts
     private var peerHosts: [String: String] = UserDefaults.standard.dictionary(forKey: "sharePeerHosts") as? [String: String] ?? [:]
     private var timers: [Timer] = []
-    private var inputWatch: AnyCancellable?
+    private var inputWatch: AnyCancellable?, switchWatch: AnyCancellable?, portsWatch: AnyCancellable?
     private var displayWatch: AnyCancellable?
     private var showsPeer = false                    // the shared monitor currently shows the peer
     private var suppressUntil = Date.distantPast     // after ⌃⌥⌘Esc: don't re-capture for a moment
@@ -127,8 +127,20 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             return true
         }
         inputWatch = MonitorModel.shared.$input.removeDuplicates().dropFirst().sink { [weak self] _ in
-            Task { @MainActor in self?.monitorInputChanged(announce: true) }
+            Task { @MainActor in self?.monitorInputChanged(announce: false) }
         }
+        // Only real switches are told to the other computer — never what a poll saw while the monitor scanned inputs.
+        switchWatch = MonitorModel.shared.realSwitch.sink { [weak self] code in
+            Task { @MainActor in
+                guard let self, self.running, MonitorInput.isValid(code) else { return }
+                guard let s = self.session else { return }
+                s.send(.monitorShows(UInt8(truncatingIfNeeded: code)))
+                ShareLog.write("told \(self.connectedName ?? "the peer"): the monitor shows \(MonitorInput.name(for: code))")
+            }
+        }
+        // The ports can be learned after connecting (fresh install): tell the other computer then too.
+        portsWatch = MonitorModel.shared.$macInput.combineLatest(MonitorModel.shared.$otherInput).dropFirst()
+            .removeDuplicates { $0 == $1 }.sink { [weak self] _ in Task { @MainActor in self?.sendMonitorPorts() } }
         displayWatch = MonitorModel.shared.$macDisplayOff.removeDuplicates().dropFirst().sink { [weak self] off in
             Task { @MainActor in ShareLog.write(off ? "Mac display to the monitor turned off" : "Mac display to the monitor turned on"); self?.applyMode() }
         }
@@ -141,12 +153,13 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         MonitorModel.shared.askPeerToSwitch = nil
         running = false
         timers.forEach { $0.invalidate() }; timers = []
-        inputWatch = nil; displayWatch = nil
+        inputWatch = nil; switchWatch = nil; portsWatch = nil; displayWatch = nil
         capture.stop()
         emulator.leave()
         controlling = false; controlled = false
         discovery.stop(); listener.stop()
         session?.close("sharing turned off"); session = nil
+        MonitorModel.shared.connectionLost()        // sharing off = as if never connected: our output back on now
         for s in pending.values { s.close("sharing turned off") }
         pending.removeAll(); pairing = nil
         discovered.removeAll(); connectedName = nil
@@ -521,6 +534,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         if controlling { capture.end(warpTo: layout()?.besideShared(0.5)); controlling = false }   // never leave input swallowed
         if controlled { emulator.leave(); controlled = false }
         ShareLog.write("disconnected: \(why)")
+        MonitorModel.shared.cancelTurnOff()
         // Still gone after 10 s (not just a quick reconnect): back to normal, as if never connected.
         q.asyncAfter(deadline: .now() + 10) { [weak self] in
             Task { @MainActor in

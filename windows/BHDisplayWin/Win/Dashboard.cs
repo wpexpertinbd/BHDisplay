@@ -456,7 +456,16 @@ internal sealed class Dashboard : Form
             _userColor.Visible = _values.TryGetValue(Vcp.ColorPreset, out var cp) && (cp.Cur & 0xFF) == Choices.UserColor;
             // monitor choice (only when there is more than one)
             bool several = _monitors.Count > 1;
-            _pickRow.Visible = several; _isShared.Visible = several && _host.SharesMonitorWithMac;
+            // The tick box: with a Mac, which monitor is connected to it (also with ONE monitor — only a ticked monitor is
+            // ever turned off); without one, which of several monitors the shortcuts use.
+            // Never offer the tick box while the marked monitor is off or missing: only the others are listed then,
+            // and ticking one of them would move the mark to the wrong monitor.
+            bool markedMissing = _host.SharedMonitorSerial.Length > 0 && !_monitors.Any(m => m.Key == _host.SharedMonitorSerial);
+            _pickRow.Visible = several;
+            _isShared.Visible = (several || _host.SharesMonitorWithMac) && !_host.SharedDisplayOff && !markedMissing;
+            _isShared.Text = _host.SharesMonitorWithMac
+                ? "This is the monitor connected to the Mac (shortcuts and keyboard sharing use it)"
+                : "Shortcuts use this monitor";
             _monitorPick.Items.Clear();
             for (int i = 0; i < _monitors.Count; i++)
             {
@@ -468,14 +477,17 @@ internal sealed class Dashboard : Form
             int shown = _monitors.FindIndex(m => m.Key == _target);
             _monitorPick.SelectedIndex = several ? shown : -1;
             bool sharedChosen = _monitors.Any(m => m.Key == _host.SharedMonitorSerial);
-            _pickNote.Visible = several && !sharedChosen && !_host.SharedDisplayOff && _host.SharesMonitorWithMac;
+            _pickNote.Visible = several && !sharedChosen && !_host.SharedDisplayOff;
+            _pickNote.Text = _host.SharesMonitorWithMac
+                ? "This PC has more than one monitor. Choose the one that is also connected to the Mac and tick the box below."
+                : "This PC has more than one monitor. Choose the one the shortcuts should switch and tick the box below.";
             _turnOff.Visible = _host.SharesMonitorWithMac && (several || _host.SharedDisplayOff);
             _shortcuts.Text = _host.SharesMonitorWithMac
                 ? "Shortcuts:  Ctrl+Alt+Win+S  Mac ⇄ this PC     Ctrl+Alt+Win+1 / 2 / 3  DisplayPort / HDMI 1 / HDMI 2"
                 : "Shortcuts:  Ctrl+Alt+Win+1 / 2 / 3  DisplayPort / HDMI 1 / HDMI 2";
             if (_host.SharedDisplayOff)
                 _via.Text = "The monitor connected to the Mac is showing the Mac — Windows' output to it is off until you switch back.";
-            _isShared.Checked = several && TargetIsShared && sharedChosen;
+            _isShared.Checked = sharedChosen && _target == _host.SharedMonitorSerial;
             _isShared.Enabled = !_isShared.Checked;
             var target = shown >= 0 ? _monitors[shown] : null;
             _info["Serial Number"].Text = Serial(target?.Serial is { Length: > 0 } ss ? ss : _details.Serial);

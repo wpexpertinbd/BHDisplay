@@ -257,6 +257,8 @@ public abstract record ShareMsg
     /// Messages that act on the receiving computer — only honoured from a paired peer.
     public bool CarriesInput => this is Enter or Leave or Move or Button or Scroll or Key or Clipboard;
 
+    private static float SafePos(float p) => Num.IsFinite(p) ? Math.Min(Math.Max(p, 0f), 1f) : 0.5f;
+
     public byte[] Encode()
     {
         var w = new WireWriter();
@@ -266,8 +268,9 @@ public abstract record ShareMsg
             case Pong: w.U8(0x02); break;
             case PairConfirm: w.U8(0x05); break;
             case PairReject: w.U8(0x06); break;
-            case Enter e: w.U8(0x10); w.U8(e.Edge); w.F32(e.Position); break;
-            case Leave l: w.U8(0x11); w.U8(l.Edge); w.F32(l.Position); break;
+            // A NaN position (a screen with no size) would make the peer close the connection: send the middle.
+            case Enter e: w.U8(0x10); w.U8(e.Edge); w.F32(SafePos(e.Position)); break;
+            case Leave l: w.U8(0x11); w.U8(l.Edge); w.F32(SafePos(l.Position)); break;
             case Move m: w.U8(0x20); w.I16(m.Dx); w.I16(m.Dy); break;
             case Button b: w.U8(0x21); w.U8(b.Number); w.U8(b.Down ? (byte)1 : (byte)0); break;
             case Scroll s: w.U8(0x22); w.I16(s.Dx); w.I16(s.Dy); break;

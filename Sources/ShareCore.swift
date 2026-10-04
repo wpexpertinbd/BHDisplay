@@ -291,8 +291,10 @@ enum ShareMsg: Equatable {
         case .pong: w.u8(0x02)
         case .pairConfirm: w.u8(0x05)
         case .pairReject: w.u8(0x06)
-        case .enter(let e, let p): w.u8(0x10); w.u8(e); w.f32(p)
-        case .leave(let e, let p): w.u8(0x11); w.u8(e); w.f32(p)
+        // A position from a screen with no size (asleep, being rearranged) can be NaN: the peer would close the
+        // connection over it ("bad edge"). Send the middle instead.
+        case .enter(let e, let p): w.u8(0x10); w.u8(e); w.f32(p.isFinite ? min(max(p, 0), 1) : 0.5)
+        case .leave(let e, let p): w.u8(0x11); w.u8(e); w.f32(p.isFinite ? min(max(p, 0), 1) : 0.5)
         case .move(let x, let y): w.u8(0x20); w.i16(x); w.i16(y)
         case .button(let b, let d): w.u8(0x21); w.u8(b); w.u8(d ? 1 : 0)
         case .scroll(let x, let y): w.u8(0x22); w.i16(x); w.i16(y)

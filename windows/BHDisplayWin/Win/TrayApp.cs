@@ -114,6 +114,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
 
     private void ToggleMonitor()
     {
+        if (!_settings.SharesMonitorWithMac) return;     // S = Mac ⇄ this PC: nothing to flip without a Mac on the monitor
         // Read the monitor off the UI thread (the input hooks live there). If it doesn't answer and our output to it
         // is off, it shows the Mac — so the toggle goes to this PC.
         Task.Run(() => Ddc.CurrentInput()).ContinueWith(t => Post(() =>
@@ -125,6 +126,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     }
 
     private int _switchGen;                 // bumped by every switch: cancels a pending turn-off decided earlier
+    private int _offGen;                    // bumped by a disconnect / sharing off: cancels a pending turn-off only
     private bool _switching;                // one local switch at a time
     private long _lastPeerRequest;
 
@@ -249,6 +251,9 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     {
         // Only while connected to the Mac that shares this monitor: without the connection, behave as if never connected.
         if (!_settings.TurnOffWhenMac || _settings.DetachedDevice.Length > 0 || _session is null || !_peerSharesMonitor) return;
+        // Only the monitor the user marked as connected to the Mac is ever turned off — never one BHDisplay guessed
+        // (a PC paired with a Mac but on another monitor would otherwise lose a screen it is using).
+        if ((_settings.SharedMonitorSerial ?? "").Length == 0) { Log.Write("not turning a monitor off: none is marked as connected to the Mac"); return; }
         _offTimer ??= new System.Windows.Forms.Timer { Interval = 6000 };
         _offTimer.Stop();
         _offTimer.Tick -= OffTick; _offTimer.Tick += OffTick;
@@ -258,13 +263,29 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     private void OffTick(object? sender, EventArgs e)
     {
         _offTimer?.Stop();
-        int gen = _switchGen;
-        Task.Run(() => (Ddc.FindShared(), Ddc.CurrentInput())).ContinueWith(t => Post(() =>
+        int gen = _switchGen, offGen = Volatile.Read(ref _offGen);
+        // One readable answer decides, as before. "No answer" is not an answer: right after an input change the
+        // monitor can stay silent on DDC for a few seconds (2026-10-04 22:05:42 "nothing readable") — ask again.
+        Task.Run(() =>
+        {
+            // Finding the monitor also needs a DDC answer (22:09:02 "can't tell which monitor"): retry both together.
+            Ddc.MonitorEntry? shared = null;
+            uint? input = null;
+            for (int i = 0; i < 12 && (shared is null || input is null); i++)
+            {
+                if (i > 0) Thread.Sleep(1000);
+                if (Volatile.Read(ref _switchGen) != gen || Volatile.Read(ref _offGen) != offGen) break;
+                shared = Ddc.FindShared();
+                input = shared is null ? null : Ddc.CurrentInput();
+            }
+            return (shared, input);
+        }).ContinueWith(t => Post(() =>
         {
             if (t.Status != TaskStatus.RanToCompletion) return;
             var (shared, input) = t.Result;
             // Anything happened since (a switch, the monitor now showing this PC)? Then this decision is stale.
-            if (gen != _switchGen || _showsPc || _settings.DetachedDevice.Length > 0 || !_settings.TurnOffWhenMac) return;
+            if (gen != _switchGen || offGen != _offGen || _showsPc || _settings.DetachedDevice.Length > 0 || !_settings.TurnOffWhenMac
+                || _session is null || !_peerSharesMonitor) return;
             if (shared is null || input != _settings.MacPort)
             {
                 Log.Write(shared is null ? "not turning the monitor off: can't tell which monitor is connected to the Mac"
@@ -283,7 +304,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                     Log.Write(back ? $"main display given back to {device}" : $"couldn't give the main display back ({DisplayPower.LastError})");
                     if (back) _ui.Send(_ => { _settings.RestorePrimary = ""; _settings.Save(); }, null);
                 }
-                bool Wanted() => Volatile.Read(ref _switchGen) == gen;
+                bool Wanted() => Volatile.Read(ref _switchGen) == gen && Volatile.Read(ref _offGen) == offGen;
 
                 if (DisplayPower.ActiveCount() < 2) { Log.Write("not turning the monitor off: it is this PC's only screen"); return; }
                 if (DisplayPower.IsPrimary(device))
@@ -305,7 +326,8 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                 bool stillWanted = false;
                 _ui.Send(_ =>
                 {
-                    stillWanted = Wanted() && !_showsPc && _settings.DetachedDevice.Length == 0 && _settings.TurnOffWhenMac;
+                    stillWanted = Wanted() && !_showsPc && _settings.DetachedDevice.Length == 0 && _settings.TurnOffWhenMac
+                                  && _session is not null && _peerSharesMonitor;
                     if (!stillWanted) return;
                     _settings.DetachedDevice = device;
                     (_settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz) = l;
@@ -571,7 +593,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
             .Where(a => a.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
             .Select(a => a.Address.ToString()));
 
-    private void StopSharing()
+    private void StopSharing(bool restore = true)
     {
         if (!_running) return;
         _running = false;
@@ -582,6 +604,12 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         _session?.Close("sharing turned off"); _session = null;
         _pairing?.S.Close("sharing turned off"); _pairing = null;
         _unpaired.Clear();
+        // Sharing off = as if never connected: no pending turn-off, and our output to the monitor back on now.
+        // (_offGen, not _switchGen: a switch already in progress must still finish.)
+        Interlocked.Increment(ref _offGen);
+        _offTimer?.Stop();
+        _peerSharesMonitor = false;
+        if (restore) RestoreOutput("sharing turned off");
         _status = "Off";
         UpdateStatus();
     }
@@ -694,6 +722,23 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         OnReady(p.S);
     }
 
+    private System.Windows.Forms.Timer? _lostTimer;
+    private void LostTick(object? sender, EventArgs e)
+    {
+        _lostTimer?.Stop();
+        if (_session is null) RestoreOutput("connection lost");
+    }
+
+    /// Our output to the shared monitor back on and the main display given back (no-op when it isn't off).
+    private void RestoreOutput(string why)
+    {
+        if (_settings.DetachedDevice.Length == 0) return;
+        Log.Write($"{why}: turning this PC's output to the monitor back on");
+        var d = (_settings.DetachedDevice, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
+        Task.Run(() => { var ok = DisplayPower.TurnOn(d.Item1, d.Item2, d.Item3, d.Item4, d.Item5, d.Item6); if (ok) RestoreMainDisplay(d.Item1); return ok; })
+            .ContinueWith(t => Post(() => DisplayTurnedOn(t.Status == TaskStatus.RanToCompletion && t.Result, d.Item1)));
+    }
+
     private void OnClosed(ShareSession s, string why)
     {
         _handshaking.Remove(s);
@@ -702,19 +747,13 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         if (_session != s) return;
         _session = null;
         _peerSharesMonitor = false;
+        Interlocked.Increment(ref _offGen);          // a turn-off in progress must not finish without the Mac (a switch still does)
         _offTimer?.Stop();
         // Still gone after 10 s (not just a quick reconnect): monitor back on, main display back — as if never connected.
-        var lost = new System.Windows.Forms.Timer { Interval = 10000 };
-        lost.Tick += (_, _) =>
-        {
-            lost.Stop(); lost.Dispose();
-            if (_session is not null || _settings.DetachedDevice.Length == 0) return;
-            Log.Write("connection lost: turning this PC's output to the monitor back on");
-            var d = (_settings.DetachedDevice, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
-            Task.Run(() => { var ok = DisplayPower.TurnOn(d.Item1, d.Item2, d.Item3, d.Item4, d.Item5, d.Item6); if (ok) RestoreMainDisplay(d.Item1); return ok; })
-                .ContinueWith(t => Post(() => DisplayTurnedOn(t.Status == TaskStatus.RanToCompletion && t.Result, d.Item1)));
-        };
-        lost.Start();
+        _lostTimer ??= new System.Windows.Forms.Timer { Interval = 10000 };
+        _lostTimer.Stop();
+        _lostTimer.Tick -= LostTick; _lostTimer.Tick += LostTick;
+        _lostTimer.Start();
         if (_controlling) { _capture.End(0.5f); _controlling = false; }    // never leave this PC's input swallowed
         if (_controlled) { _emu.Leave(); _controlled = false; }
         _status = $"Disconnected ({why})";
@@ -924,7 +963,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
 
     protected override void ExitThreadCore()
     {
-        StopSharing();                                           // release the keyboard/mouse hooks first
+        StopSharing(restore: false);                             // release the keyboard/mouse hooks first
         TurnSharedDisplayOn();                                   // never leave the shared monitor off in Windows
         _hotkeys.Dispose();
         _icon.Visible = false; _icon.Dispose();

@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import SwiftUI
 import AppKit
 
@@ -201,6 +202,10 @@ final class MonitorModel: ObservableObject {
         return v
     }
 
+    private var macSeenWhileOff = 0
+    /// Switches that really happened (shortcut, menu, window, a confirmed bounce) — the only ones told to the other computer.
+    let realSwitch = PassthroughSubject<UInt16, Never>()
+
     func refresh(full: Bool = true) {
         // While our output is off only the input is read (DDC still answers): if the monitor came back to this Mac
         // (its own buttons, Auto Detect after the other computer went off), turn our output on again.
@@ -220,12 +225,17 @@ final class MonitorModel: ObservableObject {
             var v = v
             for (c, t) in self.lastLocalChange where t > started { v[c] = nil }
             func d(_ c: UInt8) -> Double? { v[c].map { Double($0.current) } }
-            if let x = v[VCP.input] {
-                let before = self.input
+            // While this Mac's displays sleep, its DDC reads of the input are not trustworthy (2026-10-04: they said
+            // HDMI 1 while Windows was using the monitor), and the monitor scans its inputs while its computers sleep.
+            // A polled input is only ever shown — never a reason to turn a screen off (only real switches do that).
+            if let x = v[VCP.input], CGDisplayIsAsleep(CGMainDisplayID()) == 0 {
                 self.input = x.current & 0xFF
-                if self.macDisplayOff, self.input == self.macInput { self.turnSharedDisplayOn(); return }
-                // Switched with the monitor's own buttons / Auto Detect: same turn-off rule as our own switches.
-                if before != self.input, let now = self.input, now != self.macInput { self.scheduleTurnOff(for: now) }
+                // Self-repair: the monitor came back to this Mac while our output is off → output again,
+                // but only after two readings in a row (Auto Detect passes our input for a moment).
+                if self.macDisplayOff, self.input == self.macInput {
+                    self.macSeenWhileOff += 1
+                    if self.macSeenWhileOff >= 2 { self.macSeenWhileOff = 0; self.turnSharedDisplayOn(); return }
+                } else { self.macSeenWhileOff = 0 }
             }
             if let x = d(VCP.brightness) { self.brightness = x }
             if let x = d(VCP.contrast) { self.contrast = x }
@@ -247,8 +257,13 @@ final class MonitorModel: ObservableObject {
 
     /// The Mac's link type (HDMI or DP, from macOS) narrows its port to one family; if the monitor is
     /// currently showing an input of that family, that input is the Mac. Works for HDMI 1 or HDMI 2.
+    /// Only an input seen on two reads in a row: the monitor's Auto Detect passes other inputs for a moment while it
+    /// scans (DP → HDMI 2 → HDMI 1), and one such read must never rewrite which port is whose.
+    private var lastPolledInput: UInt16?
     private func learnPorts() {
         guard let cur = input, MonitorInput.isValid(cur) else { return }
+        defer { lastPolledInput = cur }
+        guard cur == lastPolledInput else { return }
         let isDP = cur == 0x0F
         if let hdmi = info.linkIsHDMI, hdmi != isDP {
             if macInput != cur { macInput = cur }
@@ -317,12 +332,14 @@ final class MonitorModel: ObservableObject {
         input = code
         notice = nil
         send(VCP.input, code, repeats: 2, delay: 0)
+        realSwitch.send(code)
         // With Auto Detect on, an input with no picture is abandoned after ~3s (measured: DP → HDMI 2 → HDMI 1).
         bounceCheck?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.io.read([VCP.input], info: false) { r, _, _ in
                 guard let self, gen == self.switchGen, let now = r[VCP.input]?.current else { return }
                 self.input = now & 0xFF
+                if now & 0xFF != code { self.realSwitch.send(now & 0xFF) }       // bounced: tell the other computer
                 if now & 0xFF != code {
                     self.notice = "\(MonitorInput.name(for: code)) has no picture — the computer on it is asleep or off, so the monitor's Auto Detect went back to \(MonitorInput.name(for: now)). Turn Auto Detect off to stay on it."
                     NSSound.beep()
@@ -342,7 +359,7 @@ final class MonitorModel: ObservableObject {
 
     /// Connection lost for a while: everything back to normal (our output to the monitor on).
     func connectionLost() {
-        turnOffCheck?.cancel()
+        cancelTurnOff()
         if macDisplayOff { turnSharedDisplayOn(); refresh() }
     }
 
@@ -352,6 +369,9 @@ final class MonitorModel: ObservableObject {
         if let i = input, i != macInput { scheduleTurnOff(for: i) }
     }
 
+    /// Disconnected: a turn-off that was waiting must not happen without the other computer.
+    func cancelTurnOff() { turnOffCheck?.cancel(); turnOffCheck = nil }
+
     func scheduleTurnOff(for code: UInt16) {
         turnOffCheck?.cancel()
         guard turnOffWhenOther, DisplayPower.available, !macDisplayOff, peerConnected() else { return }
@@ -359,7 +379,7 @@ final class MonitorModel: ObservableObject {
         let work = DispatchWorkItem { [weak self] in
             guard let self, gen == self.switchGen else { return }
             self.io.read([VCP.input], info: false) { r, _, _ in
-                guard gen == self.switchGen, self.turnOffWhenOther, let now = r[VCP.input]?.current, now & 0xFF == code,
+                guard gen == self.switchGen, self.turnOffWhenOther, self.peerConnected(), let now = r[VCP.input]?.current, now & 0xFF == code,
                       code != self.macInput, let id = self.info.displayID else { return }
                 if DisplayPower.turnOff(id) {
                     self.macDisplayOff = true
