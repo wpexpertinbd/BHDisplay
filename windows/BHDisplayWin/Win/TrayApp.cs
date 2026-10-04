@@ -30,12 +30,15 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     {
         _pairArmedUntil = DateTime.UtcNow.AddMinutes(2);
         Log.Write("ready to pair a new computer for 2 minutes");
-        _status = "Ready to pair — choose “Pair” on the Mac now (2 minutes)";
+        _status = "Ready to pair — choose “Pair” on the other computer now (2 minutes)";
         UpdateStatus(keepStatus: true);
     }
     private bool _running, _controlling, _controlled;
     private uint _clipSeq;
     private bool _showsPc;                                 // the shared monitor currently shows this PC
+    /// The current peer is a Mac sharing a monitor with this PC (it sent MONITOR_PORTS in this session). Only then are
+    /// monitor messages sent or honoured — two Windows PCs never switch or turn off each other's monitors.
+    private bool _peerSharesMonitor;
     private long _lastHandover;                            // no bouncing straight back across the boundary
     private bool RecentHandover => Num.NowMs - _lastHandover < 250;
     private string _status = "Off";
@@ -131,7 +134,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         Log.Write($"switch to {Ddc.NameOf(code)} requested here (Mac port {Ddc.NameOf(_settings.MacPort)}, connected: {_session is not null})");
         // Going back to the Mac: let the Mac do it — it may have turned its output off while the monitor
         // showed this PC, and must turn it on before the monitor switches (or the monitor sees no signal).
-        if (code == _settings.MacPort && _session is not null)
+        if (code == _settings.MacPort && _session is not null && _peerSharesMonitor)
         {
             _session.Send(new ShareMsg.SwitchRequest(code));
             Log.Write($"asked the Mac to switch the monitor to {Ddc.NameOf(code)}");
@@ -175,9 +178,9 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                 _icon.ShowBalloonTip(4000, "BHDisplay", why, ToolTipIcon.Warning);
                 return;
             }
-            if (code == _settings.MacPort)
+            if (code == _settings.MacPort && _settings.SharesMonitorWithMac && !_peerSharesMonitor)
                 _icon.ShowBalloonTip(4000, "BHDisplay", "Switched without the Mac connected — if the Mac's output to the monitor is off, it shows no signal.", ToolTipIcon.Info);
-            _session?.Send(new ShareMsg.MonitorShows(code));   // the Mac follows what the monitor shows
+            if (_peerSharesMonitor) _session?.Send(new ShareMsg.MonitorShows(code));   // the Mac follows what the monitor shows
             MonitorNowShows(code);
         }));
     }
@@ -190,7 +193,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         bool changed = showsPc != _showsPc;
         if (changed) { _showsPc = showsPc; Log.Write($"monitor shows {(showsPc ? "this PC" : "the Mac")} ({Ddc.NameOf(code)})"); }
         Interlocked.Increment(ref _switchGen);
-        if (code == _settings.MacPort) ScheduleTurnOff(); else { _offTimer?.Stop(); }
+        if (code == _settings.MacPort && _settings.SharesMonitorWithMac) ScheduleTurnOff(); else { _offTimer?.Stop(); }
         ApplyMode(changed);
     }
 
@@ -244,7 +247,8 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     /// After the monitor has STAYED on the Mac for 6 s (never on an Auto Detect bounce), detach it from the desktop.
     private void ScheduleTurnOff()
     {
-        if (!_settings.TurnOffWhenMac || _settings.DetachedDevice.Length > 0) return;
+        // Only while connected to the Mac that shares this monitor: without the connection, behave as if never connected.
+        if (!_settings.TurnOffWhenMac || _settings.DetachedDevice.Length > 0 || _session is null || !_peerSharesMonitor) return;
         _offTimer ??= new System.Windows.Forms.Timer { Interval = 6000 };
         _offTimer.Stop();
         _offTimer.Tick -= OffTick; _offTimer.Tick += OffTick;
@@ -372,6 +376,18 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         }
     }
     bool IDashboardHost.SharedDisplayOff => _settings.DetachedDevice.Length > 0;
+    bool IDashboardHost.SharesMonitorWithMac => _settings.SharesMonitorWithMac;
+    int IDashboardHost.PeerSide
+    {
+        get => _settings.MacEdge;
+        set
+        {
+            if (value is not (0 or 1)) return;
+            _settings.MacEdge = value; _settings.PeerSideChosen = true; _settings.Save();
+            _capture.Edge = _emu.Edge = value;
+            Log.Write($"the other computer is on the {(value == 0 ? "left" : "right")}");
+        }
+    }
 
     // ---------------- the BHDisplay window ----------------
 
@@ -532,9 +548,9 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
 
     private void AskForAddress()
     {
-        using var f = new Form { Text = "BHDisplay — connect to the Mac", Width = 380, Height = 160, FormBorderStyle = FormBorderStyle.FixedDialog,
+        using var f = new Form { Text = "BHDisplay — connect to the other computer", Width = 380, Height = 160, FormBorderStyle = FormBorderStyle.FixedDialog,
             StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false, TopMost = true };
-        var label = new Label { Text = "IP address of the Mac running BHDisplay (e.g. 192.168.0.123):", Left = 12, Top = 14, Width = 340 };
+        var label = new Label { Text = "IP address of the other computer running BHDisplay:", Left = 12, Top = 14, Width = 340 };
         var box = new TextBox { Left = 12, Top = 38, Width = 340 };
         var ok = new Button { Text = "Connect", Left = 196, Top = 72, Width = 75, DialogResult = DialogResult.OK };
         var cancel = new Button { Text = "Cancel", Left = 277, Top = 72, Width = 75, DialogResult = DialogResult.Cancel };
@@ -633,6 +649,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                 old.Close("duplicate connection");
             }
             _session = s;
+            _peerSharesMonitor = false;                    // until this peer says it shares a monitor (MONITOR_PORTS)
             _settings.PeerHosts[fp] = s.RemoteHost; _settings.Save();
             ApplyMode();
             UpdateStatus();
@@ -672,7 +689,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         if (_pairing is not { Local: true, Remote: true } p) return;
         _pairing = null;
         _pairArmedUntil = DateTime.MinValue;
-        _settings.Paired[P256.Hex(p.S.PeerFingerprint)] = p.S.Peer?.Name ?? "Mac";
+        _settings.Paired[P256.Hex(p.S.PeerFingerprint)] = p.S.Peer?.Name ?? "Computer";
         _settings.Save();
         OnReady(p.S);
     }
@@ -684,6 +701,20 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         if (_pairing?.S == s) _pairing = null;
         if (_session != s) return;
         _session = null;
+        _peerSharesMonitor = false;
+        _offTimer?.Stop();
+        // Still gone after 10 s (not just a quick reconnect): monitor back on, main display back — as if never connected.
+        var lost = new System.Windows.Forms.Timer { Interval = 10000 };
+        lost.Tick += (_, _) =>
+        {
+            lost.Stop(); lost.Dispose();
+            if (_session is not null || _settings.DetachedDevice.Length == 0) return;
+            Log.Write("connection lost: turning this PC's output to the monitor back on");
+            var d = (_settings.DetachedDevice, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
+            Task.Run(() => { var ok = DisplayPower.TurnOn(d.Item1, d.Item2, d.Item3, d.Item4, d.Item5, d.Item6); if (ok) RestoreMainDisplay(d.Item1); return ok; })
+                .ContinueWith(t => Post(() => DisplayTurnedOn(t.Status == TaskStatus.RanToCompletion && t.Result, d.Item1)));
+        };
+        lost.Start();
         if (_controlling) { _capture.End(0.5f); _controlling = false; }    // never leave this PC's input swallowed
         if (_controlled) { _emu.Leave(); _controlled = false; }
         _status = $"Disconnected ({why})";
@@ -703,7 +734,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         {
             case ShareMsg.Enter e:
                 if (_controlling) { _capture.End(null); _controlling = false; }
-                if (e.Edge is 0 or 1 && e.Edge != _settings.MacEdge)
+                if (e.Edge is 0 or 1 && e.Edge != _settings.MacEdge && !_settings.PeerSideChosen)
                 {   // the Mac tells us which of our edges faces it (from its display arrangement)
                     _settings.MacEdge = e.Edge; _settings.Save(); _capture.Edge = _emu.Edge = e.Edge;
                 }
@@ -714,14 +745,14 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                 if (_controlling) { _capture.End(l.Position); _controlling = false; Log.Write("← back on this PC"); }
                 else if (_controlled) { _emu.Leave(); _controlled = false; Log.Write("the Mac stopped controlling this PC"); }
                 break;
-            case ShareMsg.SwitchRequest q when q.Code == _settings.PcPort:
+            case ShareMsg.SwitchRequest q when _peerSharesMonitor && q.Code == _settings.PcPort:
                 // Only switches to THIS PC's input come here (we may need to turn our output on first).
                 s.Send(new ShareMsg.SwitchAccepted(q.Code));          // "I'm doing it" — the Mac must not switch itself
                 if (_switching || Num.NowMs - _lastPeerRequest < 1000) break;   // already on it
                 _lastPeerRequest = Num.NowMs;
                 Log.Write($"the Mac asks to switch the monitor to {Ddc.NameOf(q.Code)}");
                 Switch(q.Code); break;
-            case ShareMsg.MonitorShows ms when Ddc.IsInput(ms.Code):
+            case ShareMsg.MonitorShows ms when _peerSharesMonitor && Ddc.IsInput(ms.Code):
                 Log.Write($"the Mac says the monitor shows {Ddc.NameOf(ms.Code)}");
                 MonitorNowShows(ms.Code); break;
             case ShareMsg.Move mv: if (_controlled) { UserIsActive(); _emu.Move(mv.Dx, mv.Dy); } break;
@@ -731,7 +762,9 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
             case ShareMsg.ReleaseAll: _emu.ReleaseAll(); break;
             case ShareMsg.Clipboard c: ApplyClipboard(c.Text); break;
             case ShareMsg.MonitorPorts p when Ddc.IsInput(p.Mac) && Ddc.IsInput(p.Other) && p.Mac != p.Other:
-                _settings.MacPort = p.Mac; _settings.PcPort = p.Other; _settings.Save(); ApplyMode(); break;
+                _peerSharesMonitor = true;
+                _settings.MacPort = p.Mac; _settings.PcPort = p.Other; _settings.SharesMonitorWithMac = true; _settings.Save();
+                ApplyMode(); Changed?.Invoke(); break;
         }
         UpdateStatus();
     }
@@ -801,7 +834,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
             _status = peer is not null
                 ? _controlling ? $"Typing on {peer} — Ctrl+Alt+Win+Esc takes it back" : _controlled ? $"{peer}'s keyboard & mouse are on this PC" : $"Connected to {peer}"
                 : _settings.Paired.Count == 0
-                    ? (_unpaired.Count == 0 ? "Looking for BHDisplay on your Mac…" : "Found a computer — pair it from this menu")
+                    ? (_unpaired.Count == 0 ? "Looking for BHDisplay on your other computer…" : "Found a computer — pair it from this menu")
                     : $"Waiting for {string.Join(", ", _settings.Paired.Values)}…";
         }
         var t = "BHDisplay — " + _status;
@@ -819,12 +852,13 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         var cur = Ddc.CurrentInput();
         _menu.Items.Add(new ToolStripMenuItem($"{Ddc.MonitorName() ?? "Monitor"} — {(cur is { } c ? Ddc.NameOf(c) : "not found")}") { Enabled = false });
         _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(new ToolStripMenuItem(cur == _settings.MacPort ? "Switch to this PC" : "Switch to the Mac", null, (_, _) => ToggleMonitor())
-            { ShortcutKeyDisplayString = "Ctrl+Alt+Win+S" });
+        if (_settings.SharesMonitorWithMac)
+            _menu.Items.Add(new ToolStripMenuItem(cur == _settings.MacPort ? "Switch to this PC" : "Switch to the Mac", null, (_, _) => ToggleMonitor())
+                { ShortcutKeyDisplayString = "Ctrl+Alt+Win+S" });
         int n = 2;
         foreach (var (code, name) in Ddc.Inputs)
         {
-            var label = name + (code == _settings.MacPort ? "  ·  Mac" : code == _settings.PcPort ? "  ·  This PC" : "");
+            var label = name + (!_settings.SharesMonitorWithMac ? "" : code == _settings.MacPort ? "  ·  Mac" : code == _settings.PcPort ? "  ·  This PC" : "");
             var item = new ToolStripMenuItem(label, null, (_, _) => Switch(code)) { Checked = cur == code, ShortcutKeyDisplayString = $"Ctrl+Alt+Win+{n++ - 1}" };
             _menu.Items.Add(item);
         }
@@ -840,8 +874,12 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
             _menu.Items.Add(new ToolStripMenuItem("    " + _status) { Enabled = false });
             _menu.Items.Add(new ToolStripMenuItem("    This PC: " + LocalAddresses()) { Enabled = false });
             if (_session is null)
-                _menu.Items.Add(new ToolStripMenuItem("    Connect to the Mac by IP address…", null, (_, _) => AskForAddress()));
+                _menu.Items.Add(new ToolStripMenuItem("    Connect by IP address…", null, (_, _) => AskForAddress()));
             _menu.Items.Add(new ToolStripMenuItem("    Pair a new computer…", null, (_, _) => ArmPairing()));
+            var side = new ToolStripMenuItem("    The other computer is on my");
+            foreach (var (v, sideName) in new[] { (0, "Left"), (1, "Right") })
+                side.DropDownItems.Add(new ToolStripMenuItem(sideName, null, (_, _) => ((IDashboardHost)this).PeerSide = v) { Checked = _settings.MacEdge == v });
+            _menu.Items.Add(side);
             foreach (var (_, (b, _)) in _unpaired)
                 _menu.Items.Add(new ToolStripMenuItem($"    Pair with {b.Name}…", null, (_, _) => { ArmPairing(); _ = Dial(b.Host, Bhds.TcpPort, () => { }); }));
             foreach (var (fp, name) in _settings.Paired.ToList())

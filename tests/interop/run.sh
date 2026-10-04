@@ -21,5 +21,6 @@ round() {   # $1 = listener cmd, $2 = dialer cmd, $3 = label, $4 = port (own por
 BASE=$(( 25000 + RANDOM % 4000 ))
 round "/tmp/swiftpeer" "$DOTNET /tmp/cspeer/InteropPeer.dll" "Swift listens, C# dials" $BASE
 round "$DOTNET /tmp/cspeer/InteropPeer.dll" "/tmp/swiftpeer" "C# listens, Swift dials" $((BASE + 1))
+round "$DOTNET /tmp/cspeer/InteropPeer.dll" "$DOTNET /tmp/cspeer/InteropPeer.dll" "Windows ↔ Windows (C# listens, C# dials)" $((BASE + 2))
 [[ $fail == 0 ]] && echo "INTEROP PASSED" || echo "INTEROP FAILED"
 exit $fail

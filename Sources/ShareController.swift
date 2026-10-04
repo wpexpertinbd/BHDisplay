@@ -119,6 +119,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
                 MainActor.assumeIsolated { if self?.session != nil { MonitorModel.shared.refresh(full: false) } }
             },
         ]
+        MonitorModel.shared.peerConnected = { [weak self] in self?.session != nil }
         MonitorModel.shared.askPeerToSwitch = { [weak self] code in
             guard let self, let s = self.session else { return false }
             ShareLog.write("asked \(self.connectedName ?? "the peer") to switch the monitor to \(MonitorInput.name(for: code))")
@@ -440,6 +441,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
             ShareLog.write("connected to \(s.peer?.name ?? "?") at \(s.remoteHost)")
             sendMonitorPorts()
             if let input = MonitorModel.shared.input { s.send(.monitorShows(UInt8(truncatingIfNeeded: input))) }
+            MonitorModel.shared.connectionBack()          // pick the setup up again
             applyMode()
             updateStatus()
             return
@@ -519,6 +521,14 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         if controlling { capture.end(warpTo: layout()?.besideShared(0.5)); controlling = false }   // never leave input swallowed
         if controlled { emulator.leave(); controlled = false }
         ShareLog.write("disconnected: \(why)")
+        // Still gone after 10 s (not just a quick reconnect): back to normal, as if never connected.
+        q.asyncAfter(deadline: .now() + 10) { [weak self] in
+            Task { @MainActor in
+                guard let self, self.session == nil else { return }
+                if MonitorModel.shared.macDisplayOff { ShareLog.write("connection lost: this Mac's output to the monitor back on") }
+                MonitorModel.shared.connectionLost()
+            }
+        }
         status = "Disconnected (\(why))"
         q.asyncAfter(deadline: .now() + 2) { [weak self] in Task { @MainActor in self?.updateStatus() } }
     }

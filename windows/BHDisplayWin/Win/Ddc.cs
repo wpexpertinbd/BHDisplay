@@ -150,7 +150,9 @@ internal static partial class Ddc
 internal sealed class Settings
 {
     public bool Sharing { get; set; } = true;
-    public int MacEdge { get; set; } = 0;                  // the Mac is on the left of this PC
+    public int MacEdge { get; set; } = 0;                  // side of the other computer: 0 = left of this PC, 1 = right
+    public bool PeerSideChosen { get; set; }               // the user picked the side (else learned from the other computer)
+    public bool SharesMonitorWithMac { get; set; }         // a Mac has told us it shares a monitor with this PC
     public Dictionary<string, string> Paired { get; set; } = new();
     public Dictionary<string, string> PeerHosts { get; set; } = new();   // fingerprint → last IPv4 the peer was reached at
     public byte MacPort { get; set; } = 0x12;              // updated from the Mac (MONITOR_PORTS)

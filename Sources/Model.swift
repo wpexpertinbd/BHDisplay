@@ -202,7 +202,9 @@ final class MonitorModel: ObservableObject {
     }
 
     func refresh(full: Bool = true) {
-        guard !loading, !macDisplayOff else { return }    // no DDC path while our output is off
+        // While our output is off only the input is read (DDC still answers): if the monitor came back to this Mac
+        // (its own buttons, Auto Detect after the other computer went off), turn our output on again.
+        guard !loading, !(macDisplayOff && full) else { return }
         loading = true
         let started = Date()
         let codes: [UInt8] = full
@@ -221,6 +223,7 @@ final class MonitorModel: ObservableObject {
             if let x = v[VCP.input] {
                 let before = self.input
                 self.input = x.current & 0xFF
+                if self.macDisplayOff, self.input == self.macInput { self.turnSharedDisplayOn(); return }
                 // Switched with the monitor's own buttons / Auto Detect: same turn-off rule as our own switches.
                 if before != self.input, let now = self.input, now != self.macInput { self.scheduleTurnOff(for: now) }
             }
@@ -294,7 +297,8 @@ final class MonitorModel: ObservableObject {
         }
         // Switching back to this Mac while its output is off: turn it on FIRST and wait until the monitor
         // answers again — otherwise the monitor sees no signal on our input and Auto Detect bounces away.
-        if code == macInput, macDisplayOff {
+        // Also when the monitor was replugged while our output to it was off: macOS kept it off under a new ID.
+        if code == macInput, macDisplayOff || DisplayPower.reenableRemembered() {
             turnSharedDisplayOn()
             notice = nil
             io.waitForMonitor(timeout: 6) { [weak self] ok in
@@ -332,9 +336,25 @@ final class MonitorModel: ObservableObject {
 
     /// Turn the Mac's output off only once the monitor has STAYED on the other computer — never on a bounce
     /// (if the other computer is asleep, Auto Detect comes back to us and the display must stay on).
+    /// Set by sharing. The output is only ever turned off while the other computer is connected (Benjamin: when the
+    /// connection is lost, both behave as if they had never been connected).
+    var peerConnected: () -> Bool = { false }
+
+    /// Connection lost for a while: everything back to normal (our output to the monitor on).
+    func connectionLost() {
+        turnOffCheck?.cancel()
+        if macDisplayOff { turnSharedDisplayOn(); refresh() }
+    }
+
+    /// Connected again: re-read what the monitor shows and apply the same rules as before.
+    func connectionBack() {
+        refresh(full: false)
+        if let i = input, i != macInput { scheduleTurnOff(for: i) }
+    }
+
     func scheduleTurnOff(for code: UInt16) {
         turnOffCheck?.cancel()
-        guard turnOffWhenOther, DisplayPower.available, !macDisplayOff else { return }
+        guard turnOffWhenOther, DisplayPower.available, !macDisplayOff, peerConnected() else { return }
         let gen = switchGen
         let work = DispatchWorkItem { [weak self] in
             guard let self, gen == self.switchGen else { return }

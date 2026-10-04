@@ -26,6 +26,10 @@ internal interface IDashboardHost
     string SharedMonitorSerial { get; set; }
     bool TurnOffWhenMac { get; set; }
     bool SharedDisplayOff { get; }
+    /// A Mac shares a monitor with this PC (it told us). Otherwise the other computer is e.g. another Windows PC.
+    bool SharesMonitorWithMac { get; }
+    /// Side of the other computer: 0 = left of this PC, 1 = right.
+    int PeerSide { get; set; }
     event Action? Changed;
 }
 
@@ -54,7 +58,10 @@ internal sealed class Dashboard : Form
     private List<Ddc.MonitorEntry> _monitors = new();
     /// Monitor the window controls (null = the only one / the shared one).
     private string? _target;
-    private bool TargetIsShared => _target is null || _target == _host.SharedMonitorSerial || (_monitors.Count <= 1 && _host.SharedMonitorSerial.Length == 0);
+    private bool TargetIsShared => _host.SharesMonitorWithMac &&
+        (_target is null || _target == _host.SharedMonitorSerial || (_monitors.Count <= 1 && _host.SharedMonitorSerial.Length == 0));
+    private readonly RadioButton _sideLeft = new(), _sideRight = new();
+    private readonly Label _shortcuts = new();
     private readonly Button[] _inputButtons = new Button[3];
     private readonly Button _switch = new();
     private readonly CheckBox _autoDetect = new(), _mute = new(), _startWithWindows = new(), _sharing = new(), _turnOff = new();
@@ -259,7 +266,8 @@ internal sealed class Dashboard : Form
         _autoDetect.Text = "Auto Detect (the monitor scans for a live input by itself)"; _autoDetect.AutoSize = true;
         _autoDetect.CheckedChanged += (_, _) => { if (!_loading) _ddc.Write(Vcp.AutoDetect, _autoDetect.Checked ? 2u : 1u, _target); };
         body.Controls.Add(_autoDetect);
-        body.Controls.Add(Note("Shortcuts:  Ctrl+Alt+Win+S  Mac ⇄ this PC     Ctrl+Alt+Win+1 / 2 / 3  DisplayPort / HDMI 1 / HDMI 2"));
+        _shortcuts.AutoSize = true; _shortcuts.ForeColor = Muted; _shortcuts.Font = Small;
+        body.Controls.Add(_shortcuts);
         return card;
     }
 
@@ -348,7 +356,7 @@ internal sealed class Dashboard : Form
     private Control SharingCard()
     {
         var card = CardPanel("Keyboard & Mouse", out var body);
-        _sharing.Text = "Share keyboard & mouse with the Mac"; _sharing.AutoSize = true;
+        _sharing.Text = "Share keyboard & mouse with the other computer (Mac or Windows)"; _sharing.AutoSize = true;
         _sharing.CheckedChanged += (_, _) => { if (!_loading) _host.Sharing = _sharing.Checked; };
         body.Controls.Add(_sharing);
         _status.AutoSize = true; _status.ForeColor = Muted; _status.MaximumSize = Size.Empty; _status.Margin = new Padding(0, 4, 0, 6);
@@ -362,9 +370,17 @@ internal sealed class Dashboard : Form
         body.Controls.Add(buttons);
         _pairedList.AutoSize = true; _pairedList.FlowDirection = FlowDirection.TopDown; _pairedList.WrapContents = false; _pairedList.Margin = new Padding(0, 6, 0, 0);
         body.Controls.Add(_pairedList);
+        // Which side is the other computer on? (the pointer crosses at that edge)
+        var side = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 6, 0, 0) };
+        side.Controls.Add(new Label { Text = "The other computer is on my", AutoSize = true, Margin = new Padding(0, 4, 8, 0) });
+        _sideLeft.Text = "left"; _sideLeft.AutoSize = true; _sideRight.Text = "right"; _sideRight.AutoSize = true;
+        _sideLeft.CheckedChanged += (_, _) => { if (!_loading && _sideLeft.Checked) _host.PeerSide = 0; };
+        _sideRight.CheckedChanged += (_, _) => { if (!_loading && _sideRight.Checked) _host.PeerSide = 1; };
+        side.Controls.Add(_sideLeft); side.Controls.Add(_sideRight);
+        body.Controls.Add(side);
         body.Controls.Add(SpeedRow("Mouse speed", _mouseSpeed, _mouseSpeedValue, 5, 30, v => _host.MacMouseSpeed = v));
         body.Controls.Add(SpeedRow("Scroll speed", _scrollSpeed, _scrollSpeedValue, 5, 50, v => _host.MacScrollSpeed = v));
-        body.Controls.Add(Note("Speed of the Mac's trackpad/mouse when it is on this PC. Moving the mouse never changes the monitor."));
+        body.Controls.Add(Note("Speed of the other computer's mouse when it is on this PC. Moving the mouse never changes the monitor."));
         _startWithWindows.Text = "Start with Windows"; _startWithWindows.AutoSize = true; _startWithWindows.Margin = new Padding(0, 8, 0, 0);
         _startWithWindows.CheckedChanged += (_, _) => { if (!_loading) _host.StartWithWindows = _startWithWindows.Checked; };
         body.Controls.Add(_startWithWindows);
@@ -410,7 +426,7 @@ internal sealed class Dashboard : Form
         {
             bool found = _values.ContainsKey(Vcp.Input);
             _model.Text = found ? _details.Name : "Monitor not answering";
-            _via.Text = found ? (TargetIsShared ? $"via {Ddc.NameOf(_host.PcPort)} · also connected to the Mac" : "connected to this PC only") : "Turn on Setup Menu ▸ DDC/CI ▸ On on the monitor, then reopen this window.";
+            _via.Text = found ? (TargetIsShared ? $"via {Ddc.NameOf(_host.PcPort)} · also connected to the Mac" : _host.SharesMonitorWithMac ? "connected to this PC only" : "") : "Turn on Setup Menu ▸ DDC/CI ▸ On on the monitor, then reopen this window.";
             uint input = found ? _values[Vcp.Input].Cur & 0xFF : 0;
             foreach (var b in _inputButtons)
             {
@@ -440,20 +456,23 @@ internal sealed class Dashboard : Form
             _userColor.Visible = _values.TryGetValue(Vcp.ColorPreset, out var cp) && (cp.Cur & 0xFF) == Choices.UserColor;
             // monitor choice (only when there is more than one)
             bool several = _monitors.Count > 1;
-            _pickRow.Visible = several; _isShared.Visible = several;
+            _pickRow.Visible = several; _isShared.Visible = several && _host.SharesMonitorWithMac;
             _monitorPick.Items.Clear();
             for (int i = 0; i < _monitors.Count; i++)
             {
                 var m = _monitors[i];
                 var side = _monitors.Count == 2 ? (i == 0 ? " (left)" : " (right)") : "";
                 _monitorPick.Items.Add($"Monitor {i + 1}{side} · serial {(m.Serial.Length > 0 ? Serial(m.Serial) : "unknown")}" +
-                                       (m.Key == _host.SharedMonitorSerial ? "  —  connected to the Mac" : ""));
+                                       (_host.SharesMonitorWithMac && m.Key == _host.SharedMonitorSerial ? "  —  connected to the Mac" : ""));
             }
             int shown = _monitors.FindIndex(m => m.Key == _target);
             _monitorPick.SelectedIndex = several ? shown : -1;
             bool sharedChosen = _monitors.Any(m => m.Key == _host.SharedMonitorSerial);
-            _pickNote.Visible = several && !sharedChosen && !_host.SharedDisplayOff;
-            _turnOff.Visible = several || _host.SharedDisplayOff;
+            _pickNote.Visible = several && !sharedChosen && !_host.SharedDisplayOff && _host.SharesMonitorWithMac;
+            _turnOff.Visible = _host.SharesMonitorWithMac && (several || _host.SharedDisplayOff);
+            _shortcuts.Text = _host.SharesMonitorWithMac
+                ? "Shortcuts:  Ctrl+Alt+Win+S  Mac ⇄ this PC     Ctrl+Alt+Win+1 / 2 / 3  DisplayPort / HDMI 1 / HDMI 2"
+                : "Shortcuts:  Ctrl+Alt+Win+1 / 2 / 3  DisplayPort / HDMI 1 / HDMI 2";
             if (_host.SharedDisplayOff)
                 _via.Text = "The monitor connected to the Mac is showing the Mac — Windows' output to it is off until you switch back.";
             _isShared.Checked = several && TargetIsShared && sharedChosen;
@@ -563,6 +582,7 @@ internal sealed class Dashboard : Form
         try
         {
             _sharing.Checked = _host.Sharing;
+            _sideLeft.Checked = _host.PeerSide == 0; _sideRight.Checked = _host.PeerSide == 1;
             _status.Text = _host.Sharing ? _host.SharingStatus : "Off";
             _startWithWindows.Checked = _host.StartWithWindows;
             _mouseSpeed.Value = (int)Math.Round(Num.Clamp((float)_host.MacMouseSpeed, 0.5f, 3f) * 10);

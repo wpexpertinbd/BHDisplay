@@ -207,6 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func applicationDidFinishLaunching(_ n: Notification) {
         DisplayPower.restoreLeftover()          // our display-off never outlives a quit or crash
+        if DisplayPower.reenableRemembered() { ShareLog.write("turned the monitor back on (it was replugged while off)") }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "BHDisplay")
         // Left-click opens the window, right-click (or Control-click) shows the menu — like the Windows tray icon.

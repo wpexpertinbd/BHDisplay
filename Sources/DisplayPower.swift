@@ -28,6 +28,26 @@ enum DisplayPower {
     private static let savedKey = "displayTurnedOff"
 
     /// A display we turned off in an earlier run that was never turned back on: turn it on now.
+    /// The monitor we once turned off is connected but inactive (e.g. replugged while off): turn it on.
+    /// Only that model, never another display. True when something was turned on.
+    @discardableResult
+    static func reenableRemembered() -> Bool {
+        guard let fn = enableFn, disabledID == nil,
+              let vendor = UserDefaults.standard.object(forKey: "displayTurnedOffVendor") as? Int,
+              let model = UserDefaults.standard.object(forKey: "displayTurnedOffModel") as? Int,
+              let h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW),
+              let f = dlsym(h, "SLSGetDisplayList") else { return false }
+        typealias ListFn = @convention(c) (UInt32, UnsafeMutablePointer<CGDirectDisplayID>, UnsafeMutablePointer<UInt32>) -> CGError
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16); var n: UInt32 = 0
+        guard unsafeBitCast(f, to: ListFn.self)(16, &ids, &n) == .success else { return false }
+        var turnedOn = false
+        for id in ids.prefix(Int(n)) where CGDisplayIsBuiltin(id) == 0 && !isActive(id)
+            && Int(CGDisplayVendorNumber(id)) == vendor && Int(CGDisplayModelNumber(id)) == model {
+            if apply({ fn($0, id, true) }) { turnedOn = true }
+        }
+        return turnedOn
+    }
+
     static func restoreLeftover() {
         guard let fn = enableFn, disabledID == nil, let saved = UserDefaults.standard.object(forKey: savedKey) as? Int else { return }
         guard let id = CGDirectDisplayID(exactly: saved) else { UserDefaults.standard.removeObject(forKey: savedKey); return }
@@ -49,6 +69,10 @@ enum DisplayPower {
         guard CGGetActiveDisplayList(16, &ids, &n) == .success, n >= 2 else { return false }
         guard apply({ fn($0, id, false) }) else { return false }
         disabledID = id
+        // Remember WHICH monitor we turn off (EDID vendor/model): if it is unplugged and replugged while off, macOS keeps it
+        // off under a new display ID — reenableRemembered() finds it again by model.
+        UserDefaults.standard.set(Int(CGDisplayVendorNumber(id)), forKey: "displayTurnedOffVendor")
+        UserDefaults.standard.set(Int(CGDisplayModelNumber(id)), forKey: "displayTurnedOffModel")
         return true
     }
 
