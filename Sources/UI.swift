@@ -47,27 +47,46 @@ struct ContentView: View {
     @ObservedObject var m = MonitorModel.shared
     @State private var confirmReset = false
 
+    /// false = only the content, for measuring the window's natural size.
+    var scrolls = true
+
     var body: some View {
-        VStack(spacing: 14) {
-            header
-            HStack(alignment: .top, spacing: 14) {
-                VStack(spacing: 14) { monitorCard; inputCard; infoCard }
-                    .frame(width: 400)
-                VStack(spacing: 14) { displayCard; viewModeCard; colorCard; sharingCard }
-                    .frame(width: 430)
+        Group {
+            if scrolls {
+                // Resizable window (Benjamin, 2026-10-05: on the MacBook's own screen the window was taller than the
+                // screen and the bottom unreachable): scrolls when smaller, one column when too narrow for two.
+                ScrollView(.vertical) { content.frame(maxWidth: .infinity) }
+            } else {
+                content
             }
-            .disabled(m.input == nil && m.error != nil)
-            footer
         }
-        .padding(.horizontal, 20).padding(.top, 20).padding(.bottom, 12)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { m.refresh() }
+        .onAppear { if scrolls { m.refresh() } }
         .alert("Reset \(m.info.name) to factory settings?", isPresented: $confirmReset) {
             Button("Reset", role: .destructive) { m.factoryReset() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This restores every setting in the monitor's own menu (picture, colour, sound) to ViewSonic defaults.")
         }
+    }
+
+    private var content: some View {
+        VStack(spacing: 14) {
+            header
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 14) {
+                    VStack(spacing: 14) { monitorCard; inputCard; infoCard }
+                        .frame(width: 400)
+                    VStack(spacing: 14) { displayCard; viewModeCard; colorCard; sharingCard }
+                        .frame(width: 430)
+                }
+                VStack(spacing: 14) { monitorCard; inputCard; displayCard; viewModeCard; colorCard; sharingCard; infoCard }
+                    .frame(width: 430)
+            }
+            .disabled(m.input == nil && m.error != nil)
+            footer
+        }
+        .padding(.horizontal, 20).padding(.top, 20).padding(.bottom, 12)
     }
 
     private var footer: some View {

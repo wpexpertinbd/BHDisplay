@@ -242,12 +242,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     @objc func showWindow() {
         if window == nil {
-            let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                             backing: .buffered, defer: false)
             w.title = "BHDisplay"
             w.contentView = NSHostingView(rootView: ContentView())
+            w.contentMinSize = NSSize(width: 470, height: 360)
             w.isReleasedWhenClosed = false
             w.delegate = self
-            w.center()
+            // Natural size, but never bigger than the screen it opens on; a size the user chose is remembered.
+            if !w.setFrameUsingName("BHDisplayMain") {
+                let natural = NSHostingView(rootView: ContentView(scrolls: false)).fittingSize
+                let screen = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame.size ?? natural
+                let frame = w.frameRect(forContentRect: NSRect(origin: .zero, size: natural))
+                let chrome = frame.height - natural.height
+                w.setContentSize(NSSize(width: min(natural.width, screen.width - 40),
+                                        height: min(natural.height, screen.height - chrome - 20)))
+                w.center()
+            }
+            w.setFrameAutosaveName("BHDisplayMain")
             window = w
         }
         // Dock icon only while the settings window is open; closing it returns to menu-bar only.
