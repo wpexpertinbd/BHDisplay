@@ -14,7 +14,7 @@
     <RootNamespace>BHDisplay.Win</RootNamespace>
     <ApplicationIcon>BHDisplay.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>1.1.2</Version>
+    <Version>1.2.0</Version>
     <Product>BHDisplay</Product>
     <Company>BiswasHost</Company>
     <Copyright>© 2026 BiswasHost</Copyright>
@@ -27,6 +27,7 @@
   <ItemGroup>
     <Using Remove="System.Net.Http" />
     <Reference Include="System.Web.Extensions" />
+    <Reference Include="System.Management" />
     <!-- Reference assemblies so it builds without Windows; nothing from this package ships. -->
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
   </ItemGroup>

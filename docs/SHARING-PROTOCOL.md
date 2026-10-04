@@ -100,6 +100,7 @@ frame. A frame that fails to decrypt closes the connection. Plaintext = `type u8
 | 0x50 | MONITOR_PORTS | mac port u8, other port u8 | the monitor's VCP 0x60 values for "this Mac" and "the other computer", sent by the Mac |
 | 0x51 | MONITOR_SHOWS | input u8 | the shared monitor now shows this input (VCP 0x60 value); whoever switches it, or notices a change, tells the other |
 | 0x52 | SWITCH_REQUEST | input u8 | ask the other computer to switch the shared monitor to this input (it may first need to turn its own output to the monitor back on) |
+| 0x53 | SWITCH_ACCEPTED | input u8 | sent at once by the receiver of SWITCH_REQUEST: "I'm doing it" — the asker then must NOT switch by itself (the receiver may need several seconds to turn its output on). No answer within 2 s (older version) → the asker switches itself |
 
 **Input-carrying messages (0x10–0x40) are ignored unless the peer is paired.**
 Unknown types are ignored (forward compatibility).

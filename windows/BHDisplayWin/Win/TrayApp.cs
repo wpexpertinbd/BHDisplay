@@ -6,7 +6,7 @@ using Microsoft.Win32;
 
 namespace BHDisplay.Win;
 
-internal sealed class TrayApp : ApplicationContext
+internal sealed class TrayApp : ApplicationContext, IDashboardHost
 {
     private readonly NotifyIcon _icon;
     private readonly ContextMenuStrip _menu = new();
@@ -52,12 +52,15 @@ internal sealed class TrayApp : ApplicationContext
             Text = "BHDisplay", Visible = true, ContextMenuStrip = _menu,
         };
         _menu.Opening += (_, _) => BuildMenu();
-        _icon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ToggleMonitor(); };
+        _icon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowDashboard(); };   // Benjamin: click = open the window
         _hotkeys = new HotkeyWindow(OnHotkey, OnSessionChange);
         Current = this;
         _clipSeq = GetClipboardSequenceNumber();
 
         _capture.Edge = _emu.Edge = _settings.MacEdge;
+        _emu.Speed = _settings.MacMouseSpeed; _emu.ScrollSpeed = _settings.MacScrollSpeed;
+        Ddc.PreferredSerial = _settings.SharedMonitorSerial ?? "";
+        Log.Enabled = _settings.Logging;
         _capture.EdgeHit = pos => EdgeHit(pos);
         _capture.Captured = m => { if (_controlling) _session?.Send(m); };
         _capture.LocalHotkey = h => Post(() => OnLocalHotkey(h));   // never do slow work (DDC) inside the hook
@@ -79,11 +82,25 @@ internal sealed class TrayApp : ApplicationContext
         Log.Write("startup: message loop running");
         // Start with Windows only for the installed copy (a --portable copy in Downloads must never be auto-run).
         if (FirstRun() && Installer.IsInstalledCopy) { SetStartWithWindows(true); _settings.Save(); Log.Write("first run: start with Windows on"); }
+        TurnSharedDisplayOn();                                   // never outlives a quit or crash
+        if (_settings.DetachedDevice.Length == 0 && _settings.RestorePrimary.Length > 0)
+        {   // the main display was moved but the monitor was never turned off (crash in between): give it back
+            var dev = _settings.RestorePrimary;
+            if (DisplayPower.IsOn(dev) && !DisplayPower.IsPrimary(dev) && DisplayPower.MakePrimary(dev)) Log.Write($"main display given back to {dev}");
+            _settings.RestorePrimary = ""; _settings.Save();
+        }
         if (_settings.Sharing) StartSharing();
         UpdateStatus();
         _icon.ShowBalloonTip(5000, "BHDisplay is running",
             "It lives in the system tray (click ^ next to the clock if you don't see it). Right-click the icon for options.", ToolTipIcon.Info);
         Log.Write("tray ready: " + _status);
+        // Several monitors answer DDC and none is chosen yet: ask once which one is connected to the Mac.
+        Task.Run(() => { Ddc.CurrentInput(); return Ddc.NeedsChoice; }).ContinueWith(t =>
+        {
+            if (t.Status == TaskStatus.RanToCompletion && t.Result)
+                Post(() => _icon.ShowBalloonTip(8000, "BHDisplay — choose your monitor",
+                    "This PC has more than one monitor. Click the BHDisplay icon and choose the one that is also connected to the Mac.", ToolTipIcon.Info));
+        });
     }
 
     private void Post(Action a) => _ui.Post(_ => a(), null);
@@ -94,12 +111,23 @@ internal sealed class TrayApp : ApplicationContext
 
     private void ToggleMonitor()
     {
-        var cur = Ddc.CurrentInput();
-        Switch(cur == _settings.MacPort ? _settings.PcPort : _settings.MacPort);
+        // Read the monitor off the UI thread (the input hooks live there). If it doesn't answer and our output to it
+        // is off, it shows the Mac — so the toggle goes to this PC.
+        Task.Run(() => Ddc.CurrentInput()).ContinueWith(t => Post(() =>
+        {
+            var cur = t.Status == TaskStatus.RanToCompletion ? t.Result : null;
+            if (cur is null && _settings.DetachedDevice.Length > 0) { Switch(_settings.PcPort); return; }
+            Switch(cur == _settings.MacPort ? _settings.PcPort : _settings.MacPort);
+        }));
     }
+
+    private int _switchGen;                 // bumped by every switch: cancels a pending turn-off decided earlier
+    private bool _switching;                // one local switch at a time
+    private long _lastPeerRequest;
 
     private void Switch(byte code)
     {
+        Interlocked.Increment(ref _switchGen);
         Log.Write($"switch to {Ddc.NameOf(code)} requested here (Mac port {Ddc.NameOf(_settings.MacPort)}, connected: {_session is not null})");
         // Going back to the Mac: let the Mac do it — it may have turned its output off while the monitor
         // showed this PC, and must turn it on before the monitor switches (or the monitor sees no signal).
@@ -115,15 +143,43 @@ internal sealed class TrayApp : ApplicationContext
             }));
             return;
         }
-        if (!Ddc.Switch(code))
+        if (_switching) return;
+        _switching = true;
+        _offTimer?.Stop();
+        bool turnOn = code == _settings.PcPort && _settings.DetachedDevice.Length > 0;
+        int myGen = Volatile.Read(ref _switchGen);
+        var det = (_settings.DetachedDevice, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
+        // Everything slow (display mode change, DDC) runs off the UI thread so the keyboard/mouse hooks never stall.
+        Task.Run(() =>
         {
-            _icon.ShowBalloonTip(3000, "BHDisplay", "Couldn't switch the monitor. Turn on Setup Menu ▸ DDC/CI on the monitor.", ToolTipIcon.Warning);
-            return;
-        }
-        if (code == _settings.MacPort)
-            _icon.ShowBalloonTip(4000, "BHDisplay", "Switched without the Mac connected — if the Mac's output to the monitor is off, it shows no signal.", ToolTipIcon.Info);
-        _session?.Send(new ShareMsg.MonitorShows(code));   // the Mac follows what the monitor shows
-        MonitorNowShows(code);
+            bool on = !turnOn || DisplayPower.TurnOn(det.Item1, det.Item2, det.Item3, det.Item4, det.Item5, det.Item6);
+            if (turnOn && on) RestoreMainDisplay(det.Item1);
+            if (turnOn && on)    // our output is back: wait until the monitor answers, THEN switch (no Auto Detect bounce)
+                for (int i = 0; i < 30 && Ddc.CurrentInput() is null; i++) Thread.Sleep(200);
+            bool ok = false;
+            if (Volatile.Read(ref _switchGen) != myGen) return (on, ok: true);   // a newer choice was made meanwhile: it wins
+            for (int i = 0; on && !ok && i < 3; i++) { ok = Ddc.Switch(code); if (!ok) Thread.Sleep(400); }   // the monitor sometimes ignores the first command
+            return (on, ok);
+        }).ContinueWith(t => Post(() =>
+        {
+            _switching = false;
+            var (on, ok) = t.Status == TaskStatus.RanToCompletion ? t.Result : (false, false);
+            if (turnOn) DisplayTurnedOn(on, det.Item1);
+            if (!ok)
+            {
+                Log.Write($"switch to {Ddc.NameOf(code)} failed" + (turnOn ? $" (output on: {on}; {DisplayPower.LastError})" : ""));
+                var why = turnOn ? "The monitor didn't come back — try again."
+                    : Ddc.NeedsChoice ? "This PC has several monitors — click the BHDisplay icon and choose the one connected to the Mac."
+                    : Ddc.PreferredSerial.Length > 0 ? "The monitor connected to the Mac isn't answering. Is it on, with Setup Menu ▸ DDC/CI ▸ On?"
+                    : "Couldn't switch the monitor. Turn on Setup Menu ▸ DDC/CI on the monitor.";
+                _icon.ShowBalloonTip(4000, "BHDisplay", why, ToolTipIcon.Warning);
+                return;
+            }
+            if (code == _settings.MacPort)
+                _icon.ShowBalloonTip(4000, "BHDisplay", "Switched without the Mac connected — if the Mac's output to the monitor is off, it shows no signal.", ToolTipIcon.Info);
+            _session?.Send(new ShareMsg.MonitorShows(code));   // the Mac follows what the monitor shows
+            MonitorNowShows(code);
+        }));
     }
 
     /// "Input follows the monitor": shows the Mac → this PC's input goes to the Mac (take-over);
@@ -133,6 +189,8 @@ internal sealed class TrayApp : ApplicationContext
         bool showsPc = code == _settings.PcPort;
         bool changed = showsPc != _showsPc;
         if (changed) { _showsPc = showsPc; Log.Write($"monitor shows {(showsPc ? "this PC" : "the Mac")} ({Ddc.NameOf(code)})"); }
+        Interlocked.Increment(ref _switchGen);
+        if (code == _settings.MacPort) ScheduleTurnOff(); else { _offTimer?.Stop(); }
         ApplyMode(changed);
     }
 
@@ -166,6 +224,202 @@ internal sealed class TrayApp : ApplicationContext
     }
 
     public static TrayApp? Current { get; private set; }
+
+    /// Opens BHDisplay's log in Notepad (for sending to support).
+    public static void OpenLog()
+    {
+        try
+        {
+            if (!File.Exists(Log.FilePath)) Log.Write("log opened");
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                Path.Combine(Environment.SystemDirectory, "notepad.exe"), "\"" + Log.FilePath + "\"") { UseShellExecute = false });
+        }
+        catch (Exception e) { MessageBox.Show("Couldn't open the log:\n" + e.Message + "\n\n" + Log.FilePath, "BHDisplay"); }
+    }
+
+    // ---------------- turning Windows' output to the shared monitor off while it shows the Mac ----------------
+
+    private System.Windows.Forms.Timer? _offTimer;
+
+    /// After the monitor has STAYED on the Mac for 6 s (never on an Auto Detect bounce), detach it from the desktop.
+    private void ScheduleTurnOff()
+    {
+        if (!_settings.TurnOffWhenMac || _settings.DetachedDevice.Length > 0) return;
+        _offTimer ??= new System.Windows.Forms.Timer { Interval = 6000 };
+        _offTimer.Stop();
+        _offTimer.Tick -= OffTick; _offTimer.Tick += OffTick;
+        _offTimer.Start();
+    }
+
+    private void OffTick(object? sender, EventArgs e)
+    {
+        _offTimer?.Stop();
+        int gen = _switchGen;
+        Task.Run(() => (Ddc.FindShared(), Ddc.CurrentInput())).ContinueWith(t => Post(() =>
+        {
+            if (t.Status != TaskStatus.RanToCompletion) return;
+            var (shared, input) = t.Result;
+            // Anything happened since (a switch, the monitor now showing this PC)? Then this decision is stale.
+            if (gen != _switchGen || _showsPc || _settings.DetachedDevice.Length > 0 || !_settings.TurnOffWhenMac) return;
+            if (shared is null || input != _settings.MacPort)
+            {
+                Log.Write(shared is null ? "not turning the monitor off: can't tell which monitor is connected to the Mac"
+                                         : $"not turning the monitor off: it shows {(input is { } i ? Ddc.NameOf(i) : "nothing readable")}");
+                return;
+            }
+            var device = shared.Device;
+            // All display changes off the UI thread (the keyboard/mouse hooks live there).
+            Task.Run(() =>
+            {
+                bool movedMain = false;
+                void GiveMainBack()                     // any abort after we moved the main display: put it back
+                {
+                    if (!movedMain) return;
+                    bool back = DisplayPower.MakePrimary(device);
+                    Log.Write(back ? $"main display given back to {device}" : $"couldn't give the main display back ({DisplayPower.LastError})");
+                    if (back) _ui.Send(_ => { _settings.RestorePrimary = ""; _settings.Save(); }, null);
+                }
+                bool Wanted() => Volatile.Read(ref _switchGen) == gen;
+
+                if (DisplayPower.ActiveCount() < 2) { Log.Write("not turning the monitor off: it is this PC's only screen"); return; }
+                if (DisplayPower.IsPrimary(device))
+                {
+                    // Windows never turns off its main display (and opens apps there): make the other screen the main
+                    // one for now — and remember to give the main display back when this monitor returns (Benjamin).
+                    var other = DisplayPower.OtherDisplay(device);
+                    if (other is null || !Wanted()) return;
+                    _ui.Send(_ => { _settings.RestorePrimary = device; _settings.Save(); }, null);
+                    movedMain = DisplayPower.MakePrimary(other);
+                    Log.Write(movedMain ? $"made the other screen this PC's main display ({DisplayPower.LastError})"
+                                        : $"couldn't make the other screen the main display ({DisplayPower.LastError})");
+                    if (!movedMain) { _ui.Send(_ => { _settings.RestorePrimary = ""; _settings.Save(); }, null); return; }
+                    Thread.Sleep(500);
+                }
+                var layout = DisplayPower.CurrentLayout(device);
+                if (layout is not { } l) { Log.Write("not turning the monitor off: Windows still has it as the main display"); GiveMainBack(); return; }
+                // Record BEFORE changing anything: a crash in between still gets the monitor back at the next start.
+                bool stillWanted = false;
+                _ui.Send(_ =>
+                {
+                    stillWanted = Wanted() && !_showsPc && _settings.DetachedDevice.Length == 0 && _settings.TurnOffWhenMac;
+                    if (!stillWanted) return;
+                    _settings.DetachedDevice = device;
+                    (_settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz) = l;
+                    _settings.Save();
+                }, null);
+                if (!stillWanted) { GiveMainBack(); return; }
+                // Re-checked under the display lock: a switch back to this PC that started meanwhile wins.
+                bool off = DisplayPower.TurnOff(device, Wanted);
+                if (!off) GiveMainBack();
+                Post(() =>
+                {
+                    if (off) Log.Write($"this PC's output to the monitor turned off ({device})");
+                    else { Log.Write("not turning the monitor off after all (switched back, or Windows refused)"); if (_settings.DetachedDevice == device) { _settings.DetachedDevice = ""; _settings.Save(); } }
+                    Changed?.Invoke();
+                });
+            });
+        }));
+    }
+
+    /// Synchronous: only at start-up and quit (no keyboard/mouse forwarding in progress then).
+    private void TurnSharedDisplayOn()
+    {
+        _offTimer?.Stop();
+        if (_settings.DetachedDevice.Length == 0) return;
+        var device = _settings.DetachedDevice;
+        bool ok = DisplayPower.TurnOn(device, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
+        if (ok && _settings.RestorePrimary == device)
+        {
+            Thread.Sleep(500);
+            if (DisplayPower.MakePrimary(device)) { _settings.RestorePrimary = ""; _settings.Save(); Log.Write($"main display given back to {device}"); }
+        }
+        DisplayTurnedOn(ok, device);
+    }
+
+    /// Gives the main display back to the monitor that had it before we turned it off (background thread OK).
+    private void RestoreMainDisplay(string device)
+    {
+        string want = "";
+        _ui.Send(_ => want = _settings.RestorePrimary, null);
+        if (want != device) return;
+        Thread.Sleep(500);                                  // let Windows finish bringing the monitor back
+        bool ok = DisplayPower.MakePrimary(device);
+        Log.Write(ok ? $"main display given back to {device}" : $"couldn't give the main display back ({DisplayPower.LastError})");
+        if (ok) _ui.Send(_ => { _settings.RestorePrimary = ""; _settings.Save(); }, null);
+    }
+
+    private void DisplayTurnedOn(bool ok, string device)
+    {
+        Log.Write(ok ? $"this PC's output to the monitor turned on ({device}; {DisplayPower.LastError})"
+                     : $"couldn't turn this PC's output to the monitor back on ({DisplayPower.LastError})");
+        // Done — or that display no longer exists at all (renumbered/removed): stop trying, never get stuck "off".
+        if (ok || !DisplayPower.Exists(device)) { _settings.DetachedDevice = ""; _settings.Save(); }
+        Changed?.Invoke();
+    }
+
+    bool IDashboardHost.TurnOffWhenMac
+    {
+        get => _settings.TurnOffWhenMac;
+        set
+        {
+            _settings.TurnOffWhenMac = value; _settings.Save();
+            if (!value && _settings.DetachedDevice.Length > 0)
+            {
+                var d = (_settings.DetachedDevice, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
+                Task.Run(() => { var ok = DisplayPower.TurnOn(d.Item1, d.Item2, d.Item3, d.Item4, d.Item5, d.Item6); if (ok) RestoreMainDisplay(d.Item1); return ok; })
+                    .ContinueWith(t => Post(() => DisplayTurnedOn(t.Status == TaskStatus.RanToCompletion && t.Result, d.Item1)));
+            }
+        }
+    }
+    bool IDashboardHost.SharedDisplayOff => _settings.DetachedDevice.Length > 0;
+
+    // ---------------- the BHDisplay window ----------------
+
+    private Dashboard? _dashboard;
+    private void ShowDashboard()
+    {
+        if (_dashboard is null || _dashboard.IsDisposed)
+        {
+            _dashboard = new Dashboard(this, _ui);
+            _dashboard.FormClosed += (_, _) => _dashboard = null;
+            _dashboard.Show();
+        }
+        else { if (_dashboard.WindowState == FormWindowState.Minimized) _dashboard.WindowState = FormWindowState.Normal; _dashboard.Activate(); _dashboard.Reload(); }
+    }
+
+    public event Action? Changed;
+    private string _changedSig = "";
+    byte IDashboardHost.MacPort => _settings.MacPort;
+    byte IDashboardHost.PcPort => _settings.PcPort;
+    void IDashboardHost.SwitchInput(byte code) => Switch(code);
+    bool IDashboardHost.Sharing
+    {
+        get => _settings.Sharing;
+        set { if (_settings.Sharing == value) return; _settings.Sharing = value; _settings.Save(); if (value) StartSharing(); else StopSharing(); UpdateStatus(); }
+    }
+    string IDashboardHost.SharingStatus => _status;
+    IReadOnlyList<(string Fingerprint, string Name)> IDashboardHost.PairedComputers => _settings.Paired.Select(kv => (kv.Key, kv.Value)).ToList();
+    IReadOnlyList<(string Name, Action Pair)> IDashboardHost.FoundComputers =>
+        _unpaired.Values.Select(v => (v.B.Name, (Action)(() => { ArmPairing(); _ = Dial(v.B.Host, Bhds.TcpPort, () => { }); }))).ToList();
+    bool IDashboardHost.Connected => _session is not null;
+    void IDashboardHost.PairNewComputer() => ArmPairing();
+    void IDashboardHost.ConnectByAddress() => AskForAddress();
+    void IDashboardHost.Forget(string fp) => Forget(fp);
+    double IDashboardHost.MacMouseSpeed { get => _settings.MacMouseSpeed; set { _settings.MacMouseSpeed = value; _emu.Speed = value; _settings.Save(); } }
+    double IDashboardHost.MacScrollSpeed { get => _settings.MacScrollSpeed; set { _settings.MacScrollSpeed = value; _emu.ScrollSpeed = value; _settings.Save(); } }
+    bool IDashboardHost.StartWithWindows { get => StartsWithWindows(); set => SetStartWithWindows(value); }
+    string IDashboardHost.SharedMonitorSerial
+    {
+        get => _settings.SharedMonitorSerial ?? "";
+        set { _settings.SharedMonitorSerial = value; Ddc.PreferredSerial = value; _settings.Save(); Log.Write("monitor connected to the Mac: serial " + value); }
+    }
+
+    private void Forget(string fp)
+    {
+        _settings.Paired.Remove(fp); _settings.PeerHosts.Remove(fp); _settings.Save();
+        if (_session is { } s && P256.Hex(s.PeerFingerprint) == fp) s.Close("forgotten");
+        UpdateStatus();
+    }
 
     /// The Mac's keyboard/mouse is in use here: make sure the display is on (and stays on), like real input would.
     private long _lastActive;
@@ -460,6 +714,13 @@ internal sealed class TrayApp : ApplicationContext
                 if (_controlling) { _capture.End(l.Position); _controlling = false; Log.Write("← back on this PC"); }
                 else if (_controlled) { _emu.Leave(); _controlled = false; Log.Write("the Mac stopped controlling this PC"); }
                 break;
+            case ShareMsg.SwitchRequest q when q.Code == _settings.PcPort:
+                // Only switches to THIS PC's input come here (we may need to turn our output on first).
+                s.Send(new ShareMsg.SwitchAccepted(q.Code));          // "I'm doing it" — the Mac must not switch itself
+                if (_switching || Num.NowMs - _lastPeerRequest < 1000) break;   // already on it
+                _lastPeerRequest = Num.NowMs;
+                Log.Write($"the Mac asks to switch the monitor to {Ddc.NameOf(q.Code)}");
+                Switch(q.Code); break;
             case ShareMsg.MonitorShows ms when Ddc.IsInput(ms.Code):
                 Log.Write($"the Mac says the monitor shows {Ddc.NameOf(ms.Code)}");
                 MonitorNowShows(ms.Code); break;
@@ -545,11 +806,16 @@ internal sealed class TrayApp : ApplicationContext
         }
         var t = "BHDisplay — " + _status;
         _icon.Text = t.Length > 63 ? t.Substring(0, 63) : t;
+        // Only when something visible changed (this runs for every message while a mouse is in use).
+        var sig = $"{_status}|{_settings.Sharing}|{_settings.Paired.Count}|{_unpaired.Count}|{_session is not null}";
+        if (sig != _changedSig) { _changedSig = sig; Changed?.Invoke(); }
     }
 
     private void BuildMenu()
     {
         _menu.Items.Clear();
+        _menu.Items.Add(new ToolStripMenuItem("Open BHDisplay…", null, (_, _) => ShowDashboard()) { Font = new Font(_menu.Font, FontStyle.Bold) });
+        _menu.Items.Add(new ToolStripSeparator());
         var cur = Ddc.CurrentInput();
         _menu.Items.Add(new ToolStripMenuItem($"{Ddc.MonitorName() ?? "Monitor"} — {(cur is { } c ? Ddc.NameOf(c) : "not found")}") { Enabled = false });
         _menu.Items.Add(new ToolStripSeparator());
@@ -563,7 +829,7 @@ internal sealed class TrayApp : ApplicationContext
             _menu.Items.Add(item);
         }
         _menu.Items.Add(new ToolStripSeparator());
-        var share = new ToolStripMenuItem("Keyboard & Mouse Sharing", null, (_, _) =>
+        var share = new ToolStripMenuItem("Keyboard && Mouse Sharing", null, (_, _) =>
         {
             _settings.Sharing = !_settings.Sharing; _settings.Save();
             if (_settings.Sharing) StartSharing(); else StopSharing();
@@ -579,14 +845,18 @@ internal sealed class TrayApp : ApplicationContext
             foreach (var (_, (b, _)) in _unpaired)
                 _menu.Items.Add(new ToolStripMenuItem($"    Pair with {b.Name}…", null, (_, _) => { ArmPairing(); _ = Dial(b.Host, Bhds.TcpPort, () => { }); }));
             foreach (var (fp, name) in _settings.Paired.ToList())
-                _menu.Items.Add(new ToolStripMenuItem($"    Forget {name}", null, (_, _) =>
-                {
-                    _settings.Paired.Remove(fp); _settings.PeerHosts.Remove(fp); _settings.Save();
-                    if (_session is { } s && P256.Hex(s.PeerFingerprint) == fp) s.Close("forgotten");
-                }));
+                _menu.Items.Add(new ToolStripMenuItem($"    Forget {name}", null, (_, _) => Forget(fp)));
         }
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(new ToolStripMenuItem("Start with Windows", null, (_, _) => SetStartWithWindows(!StartsWithWindows())) { Checked = StartsWithWindows() });
+        _menu.Items.Add(new ToolStripMenuItem("Keep a Log", null, (_, _) =>
+        {
+            if (Log.Enabled) Log.Write("log turned off");
+            Log.Enabled = _settings.Logging = !Log.Enabled; _settings.Save();
+            if (Log.Enabled) Log.Write("log turned on");
+            Changed?.Invoke();
+        }) { Checked = _settings.Logging });
+        _menu.Items.Add(new ToolStripMenuItem("Check Log", null, (_, _) => OpenLog()) { Enabled = _settings.Logging });
         _menu.Items.Add(new ToolStripMenuItem("About BHDisplay", null, (_, _) => MessageBox.Show(
             $"BHDisplay for Windows {Application.ProductVersion}\n\nBuilt by BiswasHost — www.biswashost.com\nFree & open-source: github.com/wpexpertinbd/BHDisplay\n\n" +
             "Not affiliated with or endorsed by ViewSonic.", "About BHDisplay")));
@@ -609,7 +879,8 @@ internal sealed class TrayApp : ApplicationContext
 
     protected override void ExitThreadCore()
     {
-        StopSharing();
+        StopSharing();                                           // release the keyboard/mouse hooks first
+        TurnSharedDisplayOn();                                   // never leave the shared monitor off in Windows
         _hotkeys.Dispose();
         _icon.Visible = false; _icon.Dispose();
         base.ExitThreadCore();

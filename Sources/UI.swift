@@ -74,6 +74,9 @@ struct ContentView: View {
         HStack(spacing: 6) {
             Text(LocalizedStringKey("BHDisplay v\(Brand.version) · Built by [BiswasHost](\(Brand.website)) · Free & open-source"))
                 .tint(accent)
+            if ShareLog.enabled {
+                Button("Check Log") { ShareLog.open() }.buttonStyle(.link).font(.system(size: 11))
+            }
             Spacer()
             Text("Not affiliated with ViewSonic")
         }

@@ -12,6 +12,7 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        Log.Enabled = Settings.Load().Logging;          // respect "Keep a Log" from the first line
         Log.Write($"start {Application.ProductVersion} on {Environment.OSVersion} from {Application.ExecutablePath}");
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => Fatal(e.Exception);
@@ -69,8 +70,11 @@ internal static class Log
 {
     public static string FilePath => Path.Combine(Settings.Dir, "bhdisplay.log");
     private static readonly object Gate = new();
+    /// "Keep a Log" (tray menu). Crash reports are written even when it is off.
+    public static volatile bool Enabled = true;
     public static void Write(string line)
     {
+        if (!Enabled && !line.StartsWith("FATAL", StringComparison.Ordinal)) return;
         try
         {
             lock (Gate)

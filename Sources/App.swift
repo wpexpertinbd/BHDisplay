@@ -183,6 +183,19 @@ enum CLI {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     private var status: NSStatusItem!
+    private let statusMenu = NSMenu()
+
+    @objc private func statusClicked() {
+        let e = NSApp.currentEvent
+        if e?.type == .rightMouseUp || e?.modifierFlags.contains(.control) == true { showStatusMenu() } else { showWindow() }
+    }
+
+    /// Shows the menu under the icon (the menu is attached only while it is open, so a left-click stays a click).
+    private func showStatusMenu() {
+        status.menu = statusMenu
+        status.button?.performClick(nil)
+        status.menu = nil
+    }
     private var window: NSWindow?
     private var hotKeys: [EventHotKeyRef?] = []
     private let m = MonitorModel.shared
@@ -196,7 +209,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         DisplayPower.restoreLeftover()          // our display-off never outlives a quit or crash
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "BHDisplay")
-        let menu = NSMenu(); menu.delegate = self; status.menu = menu
+        // Left-click opens the window, right-click (or Control-click) shows the menu — like the Windows tray icon.
+        statusMenu.delegate = self
+        status.button?.target = self
+        status.button?.action = #selector(statusClicked)
+        status.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         registerHotKeys()
         LegacyCleanup.removeOldSharingJob()
         ShareController.shared.bootstrap()
@@ -207,7 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { MonitorModel.shared.refresh() }
         }, nil)
         if CommandLine.arguments.contains("-DocsOpenMenu") {   // docs only: pop the menu for a screenshot
-            DispatchQueue.main.asyncAfter(deadline: .now() + 10) { self.status.button?.performClick(nil) }   // after sharing reconnects
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) { self.showStatusMenu() }   // after sharing reconnects
             return
         }
         if !launchedAsLoginItem() { showWindow() }
@@ -271,6 +288,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         ad.isEnabled = m.autoDetect != nil
         menu.addItem(ad)
         menu.addItem(.separator())
+        let keep = NSMenuItem(title: "Keep a Log", action: #selector(toggleLog), keyEquivalent: ""); keep.target = self
+        keep.state = ShareLog.enabled ? .on : .off
+        menu.addItem(keep)
+        let check = NSMenuItem(title: "Check Log…", action: ShareLog.enabled ? #selector(checkLog) : nil, keyEquivalent: ""); check.target = self
+        check.isEnabled = ShareLog.enabled
+        menu.addItem(check)
+        menu.addItem(.separator())
         let ab = NSMenuItem(title: "About BHDisplay", action: #selector(showAbout), keyEquivalent: ""); ab.target = self
         menu.addItem(ab)
         let o = NSMenuItem(title: "Open BHDisplay…", action: #selector(showWindow), keyEquivalent: ","); o.target = self
@@ -311,6 +335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if share.enabled && share.needsAccessibility { showWindow() }
     }
     @objc private func armPairing() { ShareController.shared.armPairing() }
+    @objc private func toggleLog() {
+        if ShareLog.enabled { ShareLog.write("log turned off"); ShareLog.enabled = false }
+        else { ShareLog.enabled = true; ShareLog.write("log turned on") }
+    }
+    @objc private func checkLog() { ShareLog.open() }
     @objc private func pairDevice(_ item: NSMenuItem) {
         let share = ShareController.shared
         if let id = item.representedObject as? String, let d = share.discovered.first(where: { $0.id == id }) { share.pair(with: d) }

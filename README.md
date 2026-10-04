@@ -19,7 +19,7 @@ sharing it never had. 100% open-source.
 | Platform | Status |
 |----------|--------|
 | 🍎 **macOS** | ✅ **Stable** — native menu-bar app (Apple Silicon, macOS 14+) |
-| 🪟 **Windows** | ✅ **New** — tray app, 0.2 MB (Windows 10 / 11) — input switching + keyboard & mouse sharing |
+| 🪟 **Windows** | ✅ **Stable** — tray app with the same window, 0.2 MB (Windows 10 / 11) — input switching, monitor controls, keyboard & mouse sharing |
 
 > 🟢 Runs the author's daily setup — one ViewSonic XG2409A shared between a MacBook Pro and a Windows PC.
 
@@ -53,9 +53,10 @@ menu uses. No drivers, no background services, no account — just a menu-bar ic
   **Auto Detect** switch to keep the monitor where you put it.
 - **One keyboard & mouse for both computers** — whichever keyboard and mouse is nearest your
   hand works on either computer: move the pointer across the screen edge and keep typing.
-- **No phantom second screen** — while the monitor shows the PC, BHDisplay turns the Mac's output
-  to it off, so the Mac behaves like a plain MacBook (windows stay on its own screen, the pointer
-  can't get lost on a monitor you can't see). It comes back on when you switch to the Mac.
+- **No phantom screens, on either computer** — while the monitor shows the PC, the Mac turns its output
+  to it off, so the Mac behaves like a plain MacBook; while it shows the Mac, a PC with another screen does
+  the same. Switching back turns it on first, so the monitor never sees an empty input.
+- **Logs when you need them** — **Keep a Log** / **Check Log** in the menu of both apps.
 
 ![BHDisplay menu-bar menu](docs/screenshots/menu-bar-1.1.png)
 
@@ -169,7 +170,16 @@ already part of Windows, so there is nothing else to install).
 2. It installs itself for your user (no admin password): into your Programs folder, with a
    **Start menu** entry, and it **starts with Windows**. You can delete the downloaded file.
 3. BHDisplay lives in the **system tray** (click **^** next to the clock if you don't see it).
+   **Click** the icon for the BHDisplay window — the same controls as on the Mac: inputs, brightness,
+   contrast, sharpness, blue light filter, volume, View Mode, colour temperature, monitor information
+   and keyboard & mouse sharing. **Right-click** for the quick menu.
    If Windows asks whether BHDisplay may use the network, allow **Private networks**.
+4. **More than one monitor on the PC?** Pick a monitor at the top of the window to adjust *that* one
+   (**Identify** shows which is which), and tick **"This is the monitor connected to the Mac"** on the one
+   your Mac shares — the shortcuts and keyboard sharing always use that monitor.
+   While that monitor shows the Mac, Windows **turns its output to it off** (and makes your other screen the main
+   display), so apps never open on a screen you can't see. Switching back to the PC turns it on again first and
+   gives the main display back — your arrangement returns exactly as it was.
 
 **Update:** run the newer download — it replaces the installed copy and keeps your pairing.
 **Remove:** **Settings ▸ Apps ▸ BHDisplay ▸ Uninstall**.
@@ -180,7 +190,8 @@ already part of Windows, so there is nothing else to install).
 1. On the monitor: **Setup Menu ▸ DDC/CI ▸ On**.
 2. Open **BHDisplay** — the window shows your monitor, with your Mac's port marked *This Mac*.
 3. Click an input, or press **⌃⌥⌘S** to flip to the other computer and back.
-4. Close the window — BHDisplay keeps running in the menu bar. Tick **Launch at Login** there.
+4. Close the window — BHDisplay keeps running in the menu bar: **click** its icon to open the window again,
+   **right-click** for the menu (tick **Launch at Login** there).
 5. Optional: install BHDisplay on the PC and pair them (see *Keyboard & mouse sharing*) — then
    **Ctrl+Alt+Win+S** on the PC switches the monitor too, and either keyboard works on both.
 

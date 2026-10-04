@@ -119,6 +119,12 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
                 MainActor.assumeIsolated { if self?.session != nil { MonitorModel.shared.refresh(full: false) } }
             },
         ]
+        MonitorModel.shared.askPeerToSwitch = { [weak self] code in
+            guard let self, let s = self.session else { return false }
+            ShareLog.write("asked \(self.connectedName ?? "the peer") to switch the monitor to \(MonitorInput.name(for: code))")
+            s.send(.switchRequest(UInt8(truncatingIfNeeded: code)))
+            return true
+        }
         inputWatch = MonitorModel.shared.$input.removeDuplicates().dropFirst().sink { [weak self] _ in
             Task { @MainActor in self?.monitorInputChanged(announce: true) }
         }
@@ -131,6 +137,7 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
 
     func stop() {
         guard running || needsAccessibility else { return }
+        MonitorModel.shared.askPeerToSwitch = nil
         running = false
         timers.forEach { $0.invalidate() }; timers = []
         inputWatch = nil; displayWatch = nil
@@ -557,6 +564,9 @@ final class ShareController: NSObject, ObservableObject, ShareCaptureDelegate {
         case .switchRequest(let code):
             // The other computer asks us to switch (we may need to turn our output back on first).
             if MonitorInput.isValid(UInt16(code)) { ShareLog.write("switch requested by peer: \(MonitorInput.name(for: UInt16(code)))"); MonitorModel.shared.switchTo(UInt16(code)) }
+        case .switchAccepted(let code):
+            ShareLog.write("\(connectedName ?? "peer") is switching the monitor to \(MonitorInput.name(for: UInt16(code)))")
+            MonitorModel.shared.peerAcceptedSwitch(UInt16(code))
         case .monitorShows(let code):
             ShareLog.write("peer says the monitor shows \(MonitorInput.name(for: UInt16(code)))")
             if MonitorInput.isValid(UInt16(code)), MonitorModel.shared.input != UInt16(code) {
@@ -661,7 +671,18 @@ enum ShareLog {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/BHDisplay/sharing.log")
     }
     private static let fmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f }()
+    /// "Keep a Log" (menu) — on unless the user turned it off.
+    static var enabled: Bool {
+        get { UserDefaults.standard.object(forKey: "logEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "logEnabled") }
+    }
+    /// Opens the log (Console, or the app set for .log files).
+    static func open() {
+        if !FileManager.default.fileExists(atPath: url.path) { write("log opened") }
+        NSWorkspace.shared.open(url)
+    }
     static func write(_ line: String) {
+        guard enabled else { return }
         let u = url
         try? FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let size = (try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? Int, size > 256 * 1024 {

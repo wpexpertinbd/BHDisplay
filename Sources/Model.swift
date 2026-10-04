@@ -270,8 +270,28 @@ final class MonitorModel: ObservableObject {
     @Published private(set) var macDisplayOff = false
     private var turnOffCheck: DispatchWorkItem?
 
+    /// Set by sharing: hands a switch to the OTHER computer's input over to that computer (it may have to turn
+    /// its output to the monitor on first). Returns false when there is no connection — then we switch ourselves.
+    var askPeerToSwitch: ((UInt16) -> Bool)?
+    private var peerSwitchFallback: DispatchWorkItem?
+
     func switchTo(_ code: UInt16) {
         guard MonitorInput.isValid(code) else { return }
+        peerSwitchFallback?.cancel(); peerSwitchFallback = nil      // the latest choice wins
+        // Only a switch to the OTHER computer's own input goes to it (it may have to turn its output on first).
+        if code != macInput, code == otherInput, let ask = askPeerToSwitch, ask(code) {
+            pendingPeerSwitch = code
+            // No "accepted" from the other computer within 2 s (older version, not really connected): do it ourselves.
+            // Once it accepts, it switches — it may need several seconds to turn its own output on first.
+            peerSwitchFallback?.cancel()
+            let w = DispatchWorkItem { [weak self] in
+                guard let self, self.input != code else { return }
+                self.performSwitch(code)
+            }
+            peerSwitchFallback = w
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: w)
+            return
+        }
         // Switching back to this Mac while its output is off: turn it on FIRST and wait until the monitor
         // answers again — otherwise the monitor sees no signal on our input and Auto Detect bounces away.
         if code == macInput, macDisplayOff {
@@ -340,8 +360,16 @@ final class MonitorModel: ObservableObject {
     }
 
     /// The other computer switched the monitor itself and told us: reflect it without sending a command.
+    /// The other computer accepted our switch request: it does the switch, we don't.
+    private var pendingPeerSwitch: UInt16?
+    func peerAcceptedSwitch(_ code: UInt16) {
+        guard code == pendingPeerSwitch else { return }        // a late answer to an older request changes nothing
+        peerSwitchFallback?.cancel(); peerSwitchFallback = nil; pendingPeerSwitch = nil
+    }
+
     func adoptInput(_ code: UInt16) {
         guard MonitorInput.isValid(code) else { return }
+        peerSwitchFallback?.cancel(); peerSwitchFallback = nil      // the other computer did it
         switchGen += 1                        // supersede any pending re-check of an older switch
         input = code
         notice = nil

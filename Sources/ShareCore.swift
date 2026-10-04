@@ -273,6 +273,7 @@ enum ShareMsg: Equatable {
     case monitorPorts(mac: UInt8, other: UInt8)
     case monitorShows(UInt8)
     case switchRequest(UInt8)
+    case switchAccepted(UInt8)
     case unknown(UInt8)
 
     /// Messages that act on the receiving computer — only honoured from a paired peer.
@@ -301,6 +302,7 @@ enum ShareMsg: Equatable {
         case .monitorPorts(let m, let o): w.u8(0x50); w.u8(m); w.u8(o)
         case .monitorShows(let c): w.u8(0x51); w.u8(c)
         case .switchRequest(let c): w.u8(0x52); w.u8(c)
+        case .switchAccepted(let c): w.u8(0x53); w.u8(c)
         case .unknown(let t): w.u8(t)
         }
         return w.data
@@ -334,6 +336,7 @@ enum ShareMsg: Equatable {
         case 0x50: return .monitorPorts(mac: try r.u8(), other: try r.u8())
         case 0x51: return .monitorShows(try r.u8())
         case 0x52: return .switchRequest(try r.u8())
+        case 0x53: return .switchAccepted(try r.u8())
         default: return .unknown(t)
         }
     }

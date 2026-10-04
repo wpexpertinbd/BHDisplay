@@ -189,11 +189,18 @@ internal sealed class Emulator
         Send(Mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, ax, ay));
     }
 
+    /// User multipliers for the Mac's mouse and scroll wheel on this PC (dashboard sliders).
+    public double Speed = 1, ScrollSpeed = 1;
+    private double _remX, _remY, _remWheelX, _remWheelY;
+
     public void Move(short dx, short dy)
     {
         if (!Active) return;
+        double fx = dx * Speed + _remX, fy = dy * Speed + _remY;
+        int mx = (int)fx, my = (int)fy;
+        _remX = fx - mx; _remY = fy - my;
         GetCursorPos(out var cur);
-        var target = new POINT { X = cur.X + dx, Y = cur.Y + dy };
+        var target = new POINT { X = cur.X + mx, Y = cur.Y + my };
         var p = Screens.Clamp(target);
         MoveTo(p);
         bool pushingOut = _handBack && (Edge == 0 ? dx < 0 : dx > 0);
@@ -220,8 +227,11 @@ internal sealed class Emulator
     public void Scroll(short dx, short dy)
     {
         if (!Active) return;
-        if (dy != 0) Send(Mouse(MOUSEEVENTF_WHEEL, data: unchecked((uint)dy)));
-        if (dx != 0) Send(Mouse(MOUSEEVENTF_HWHEEL, data: unchecked((uint)dx)));
+        double wy = dy * ScrollSpeed + _remWheelY, wx = dx * ScrollSpeed + _remWheelX;
+        int sy = (int)Math.Max(int.MinValue / 2, Math.Min(int.MaxValue / 2, wy)), sx = (int)Math.Max(int.MinValue / 2, Math.Min(int.MaxValue / 2, wx));
+        _remWheelY = wy - sy; _remWheelX = wx - sx;
+        if (sy != 0) Send(Mouse(MOUSEEVENTF_WHEEL, data: unchecked((uint)sy)));
+        if (sx != 0) Send(Mouse(MOUSEEVENTF_HWHEEL, data: unchecked((uint)sx)));
     }
 
     public void Key(ushort usage, bool down)
