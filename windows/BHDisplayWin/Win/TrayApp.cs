@@ -54,7 +54,9 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application,
             Text = "BHDisplay", Visible = true, ContextMenuStrip = _menu,
         };
-        _menu.Opening += (_, _) => BuildMenu();
+        // Build from what we last read and show at once; the monitor is asked in the background (DDC takes a second or
+        // more with two monitors, and a tray menu that is slow to open closes again → "right-click twice").
+        _menu.Opening += (_, e) => { BuildMenu(); e.Cancel = false; RefreshMenuMonitor(); };
         _icon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowDashboard(); };   // Benjamin: click = open the window
         _hotkeys = new HotkeyWindow(OnHotkey, OnSessionChange);
         Current = this;
@@ -97,6 +99,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         _icon.ShowBalloonTip(5000, "BHDisplay is running",
             "It lives in the system tray (click ^ next to the clock if you don't see it). Right-click the icon for options.", ToolTipIcon.Info);
         Log.Write("tray ready: " + _status);
+        RefreshMenuMonitor();                                   // so the first right-click already shows the monitor
         // Several monitors answer DDC and none is chosen yet: ask once which one is connected to the Mac.
         Task.Run(() => { Ddc.CurrentInput(); return Ddc.NeedsChoice; }).ContinueWith(t =>
         {
@@ -883,13 +886,31 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         if (sig != _changedSig) { _changedSig = sig; Changed?.Invoke(); }
     }
 
+    private uint? _menuInput;
+    private string? _menuMonitor;
+    private bool _menuRead, _menuReading;
+
+    private void RefreshMenuMonitor()
+    {
+        if (_menuReading) return;
+        _menuReading = true;
+        Task.Run(() => (Ddc.CurrentInput(), Ddc.MonitorName())).ContinueWith(t => Post(() =>
+        {
+            _menuReading = false;
+            if (t.Status != TaskStatus.RanToCompletion) return;
+            bool changed = !_menuRead || _menuInput != t.Result.Item1 || _menuMonitor != t.Result.Item2;
+            (_menuInput, _menuMonitor, _menuRead) = (t.Result.Item1, t.Result.Item2, true);
+            if (changed && _menu.Visible) BuildMenu();      // still open: show the fresh reading
+        }));
+    }
+
     private void BuildMenu()
     {
         _menu.Items.Clear();
         _menu.Items.Add(new ToolStripMenuItem("Open BHDisplay…", null, (_, _) => ShowDashboard()) { Font = new Font(_menu.Font, FontStyle.Bold) });
         _menu.Items.Add(new ToolStripSeparator());
-        var cur = Ddc.CurrentInput();
-        _menu.Items.Add(new ToolStripMenuItem($"{Ddc.MonitorName() ?? "Monitor"} — {(cur is { } c ? Ddc.NameOf(c) : "not found")}") { Enabled = false });
+        var cur = _menuInput;
+        _menu.Items.Add(new ToolStripMenuItem($"{_menuMonitor ?? "Monitor"} — {(cur is { } c ? Ddc.NameOf(c) : _menuRead ? "not found" : "reading…")}") { Enabled = false });
         _menu.Items.Add(new ToolStripSeparator());
         if (_settings.SharesMonitorWithMac)
             _menu.Items.Add(new ToolStripMenuItem(cur == _settings.MacPort ? "Switch to this PC" : "Switch to the Mac", null, (_, _) => ToggleMonitor())
