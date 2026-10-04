@@ -261,6 +261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             }
             w.setFrameAutosaveName("BHDisplayMain")
             window = w
+            updateColumns()
         }
         // Dock icon only while the settings window is open; closing it returns to menu-bar only.
         NSApp.setActivationPolicy(.regular)
@@ -270,7 +271,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
 
-    func windowWillClose(_ n: Notification) { NSApp.setActivationPolicy(.accessory) }
+    func windowWillClose(_ n: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        // Let the closed window go entirely: a kept SwiftUI view keeps updating (and laying out) in the background.
+        DispatchQueue.main.async { [weak self] in self?.window?.contentView = nil; self?.window = nil }
+    }
+
+    func windowDidResize(_ n: Notification) { updateColumns() }
+
+    private func updateColumns() {
+        guard let w = window else { return }
+        let two = w.contentLayoutRect.width >= WindowLayout.twoColumnWidth - 1
+        if WindowLayout.shared.twoColumns != two { WindowLayout.shared.twoColumns = two }
+    }
 
     // Rebuilt on every open so the tick reflects the monitor's answer, not a cached guess.
     func menuNeedsUpdate(_ menu: NSMenu) {

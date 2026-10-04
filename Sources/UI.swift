@@ -43,8 +43,18 @@ struct SliderRow: View {
     }
 }
 
+/// One or two columns, decided by the window's width (set by the window's resize callback). ViewThatFits inside the
+/// ScrollView re-measured both layouts endlessly — ~95% CPU even with the window closed (1.3.4), which made the
+/// other computer's pointer stutter on the Mac.
+final class WindowLayout: ObservableObject {
+    static let shared = WindowLayout()
+    static let twoColumnWidth: CGFloat = 884
+    @Published var twoColumns = true
+}
+
 struct ContentView: View {
     @ObservedObject var m = MonitorModel.shared
+    @ObservedObject var lay = WindowLayout.shared
     @State private var confirmReset = false
 
     /// false = only the content, for measuring the window's natural size.
@@ -55,7 +65,7 @@ struct ContentView: View {
             if scrolls {
                 // Resizable window (Benjamin, 2026-10-05: on the MacBook's own screen the window was taller than the
                 // screen and the bottom unreachable): scrolls when smaller, one column when too narrow for two.
-                ScrollView(.vertical) { content.frame(maxWidth: .infinity) }
+                ScrollView(.vertical) { content.frame(maxWidth: .infinity, alignment: .top) }
             } else {
                 content
             }
@@ -73,15 +83,18 @@ struct ContentView: View {
     private var content: some View {
         VStack(spacing: 14) {
             header
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 14) {
-                    VStack(spacing: 14) { monitorCard; inputCard; infoCard }
-                        .frame(width: 400)
-                    VStack(spacing: 14) { displayCard; viewModeCard; colorCard; sharingCard }
+            Group {
+                if lay.twoColumns || !scrolls {
+                    HStack(alignment: .top, spacing: 14) {
+                        VStack(spacing: 14) { monitorCard; inputCard; infoCard }
+                            .frame(width: 400)
+                        VStack(spacing: 14) { displayCard; viewModeCard; colorCard; sharingCard }
+                            .frame(width: 430)
+                    }
+                } else {
+                    VStack(spacing: 14) { monitorCard; inputCard; displayCard; viewModeCard; colorCard; sharingCard; infoCard }
                         .frame(width: 430)
                 }
-                VStack(spacing: 14) { monitorCard; inputCard; displayCard; viewModeCard; colorCard; sharingCard; infoCard }
-                    .frame(width: 430)
             }
             .disabled(m.input == nil && m.error != nil)
             footer
