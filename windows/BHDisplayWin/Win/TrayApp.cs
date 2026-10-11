@@ -118,13 +118,17 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     private void ToggleMonitor()
     {
         if (!_settings.SharesMonitorWithMac) return;     // S = Mac ⇄ this PC: nothing to flip without a Mac on the monitor
-        // Read the monitor off the UI thread (the input hooks live there). If it doesn't answer and our output to it
-        // is off, it shows the Mac — so the toggle goes to this PC.
+        // Our output to the shared monitor is off only while it shows the Mac: then the toggle goes to this PC, with no
+        // need to ask the monitor (2026-10-05 20:15/20:20: asking it while it was switched off from Windows gave an
+        // answer that wasn't the Mac's input, so Ctrl+Alt+Win+S asked the Mac for the Mac — several times).
+        if (_settings.DetachedDevice.Length > 0) { Log.Write("toggle: this PC's output is off, so the monitor shows the Mac"); Switch(_settings.PcPort); return; }
+        // Otherwise read the monitor off the UI thread (the input hooks live there); no answer → what we were last told.
         Task.Run(() => Ddc.CurrentInput()).ContinueWith(t => Post(() =>
         {
             var cur = t.Status == TaskStatus.RanToCompletion ? t.Result : null;
-            if (cur is null && _settings.DetachedDevice.Length > 0) { Switch(_settings.PcPort); return; }
-            Switch(cur == _settings.MacPort ? _settings.PcPort : _settings.MacPort);
+            Log.Write($"toggle: the monitor reads {(cur is { } c ? Ddc.NameOf(c) : "nothing")}");
+            bool showsMac = cur is { } v ? v == _settings.MacPort : !_showsPc;
+            Switch(showsMac ? _settings.PcPort : _settings.MacPort);
         }));
     }
 
@@ -904,6 +908,10 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         }));
     }
 
+    /// Same rule as the toggle: our output off = the Mac; else the monitor's answer; else what we were last told.
+    private bool MenuShowsMac(uint? cur) =>
+        _settings.DetachedDevice.Length > 0 || (cur is { } v ? v == _settings.MacPort : !_showsPc);
+
     private void BuildMenu()
     {
         _menu.Items.Clear();
@@ -913,7 +921,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         _menu.Items.Add(new ToolStripMenuItem($"{_menuMonitor ?? "Monitor"} — {(cur is { } c ? Ddc.NameOf(c) : _menuRead ? "not found" : "reading…")}") { Enabled = false });
         _menu.Items.Add(new ToolStripSeparator());
         if (_settings.SharesMonitorWithMac)
-            _menu.Items.Add(new ToolStripMenuItem(cur == _settings.MacPort ? "Switch to this PC" : "Switch to the Mac", null, (_, _) => ToggleMonitor())
+            _menu.Items.Add(new ToolStripMenuItem(MenuShowsMac(cur) ? "Switch to this PC" : "Switch to the Mac", null, (_, _) => ToggleMonitor())
                 { ShortcutKeyDisplayString = "Ctrl+Alt+Win+S" });
         int n = 2;
         foreach (var (code, name) in Ddc.Inputs)
