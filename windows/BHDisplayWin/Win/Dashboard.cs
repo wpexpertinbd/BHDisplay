@@ -12,6 +12,10 @@ internal interface IDashboardHost
     byte MacPort { get; }
     byte PcPort { get; }
     void SwitchInput(byte code);
+    /// Mac ⇄ this PC, decided like Ctrl+Alt+Win+S (what the monitor shows now, not the window's last reading).
+    void ToggleSharedMonitor();
+    /// What the shared monitor shows as far as BHDisplay knows (kept current by both computers' announcements).
+    bool MonitorShowsMac { get; }
     bool Sharing { get; set; }
     string SharingStatus { get; }
     IReadOnlyList<(string Fingerprint, string Name)> PairedComputers { get; }
@@ -65,6 +69,9 @@ internal sealed class Dashboard : Form
     /// them is here, so the list fell back to another one. Everything is shown but nothing may be written to it
     /// until the user picks a monitor — a slider must never change a screen they did not mean.
     private bool _fellBack;
+    /// What the switch button was last drawn for, so a monitor switch made elsewhere refreshes the window.
+    private bool? _shownShowsMac;
+    private int _silentRetries;
     /// The monitor the user picked in the dropdown (or ticked) — never set by a fallback, so a monitor the window
     /// merely landed on can never later look like a choice the user made.
     private string? _userTarget;
@@ -270,7 +277,9 @@ internal sealed class Dashboard : Form
         }
         body.Controls.Add(row);
         _switch.AutoSize = true; _switch.FlatStyle = FlatStyle.Flat; _switch.Margin = new Padding(0, 6, 0, 2); _switch.Padding = new Padding(10, 3, 10, 3);
-        _switch.Click += (_, _) => SwitchTo(_values.TryGetValue(Vcp.Input, out var v) && (v.Cur & 0xFF) == _host.MacPort ? _host.PcPort : _host.MacPort);
+        // Decided like Ctrl+Alt+Win+S; the button and the input buttons then follow what both computers announce
+        // (no re-read of every setting here: that tied up the monitor right when it is busiest, after a switch).
+        _switch.Click += (_, _) => _host.ToggleSharedMonitor();
         body.Controls.Add(_switch);
         _turnOff.Text = "Turn this monitor off in Windows while it shows the Mac (apps stay on your other screen)";
         _turnOff.AutoSize = true; _turnOff.Checked = _host.TurnOffWhenMac;
@@ -431,7 +440,21 @@ internal sealed class Dashboard : Form
             // the monitor they picked in the dropdown)
             bool fellBack = shared.Count > 0 && key != null && !shared.Contains(key) && want != key;
             return (Ddc.ReadMany(Vcp.Panel, key), MonitorDetails.Read(entry?.Serial ?? "", entry?.Device), list, key, fellBack);
-        }, r => { if (IsDisposed) return; _values = r.Item1; _details = r.Item2; _monitors = r.Item3; _target = r.Item4; _fellBack = r.Item5; Fill(); });
+        }, r =>
+        {
+            if (IsDisposed) return;
+            _values = r.Item1; _details = r.Item2; _monitors = r.Item3; _target = r.Item4; _fellBack = r.Item5; Fill();
+            // Opened while the monitor was silent (it often is for a few seconds after a switch): look again by itself,
+            // gently — twice at most, 5 s apart — instead of asking the user to reopen the window.
+            if (_values.ContainsKey(Vcp.Input)) _silentRetries = 0;
+            else if (_silentRetries < 2)
+            {
+                _silentRetries++;
+                var t = new System.Windows.Forms.Timer { Interval = 5000 };
+                t.Tick += (_, _) => { t.Stop(); t.Dispose(); if (!IsDisposed) Reload(); };
+                t.Start();
+            }
+        });
     }
 
     private void Merge(Dictionary<byte, (uint Cur, uint Max)> r) { foreach (var kv in r) _values[kv.Key] = kv.Value; }
@@ -442,7 +465,7 @@ internal sealed class Dashboard : Form
         try
         {
             bool found = _values.ContainsKey(Vcp.Input);
-            _model.Text = found ? _details.Name : "Monitor not answering";
+            _model.Text = found ? _details.Name : _silentRetries < 2 ? "Waiting for the monitor to answer…" : "Monitor not answering";
             _via.Text = found ? (TargetIsShared ? $"via {Ddc.NameOf(_host.PcPort)} · also connected to the Mac" : _host.SharesMonitorWithMac ? "connected to this PC only" : "") : "Turn on Setup Menu ▸ DDC/CI ▸ On on the monitor, then reopen this window.";
             uint input = found ? _values[Vcp.Input].Cur & 0xFF : 0;
             foreach (var b in _inputButtons)
@@ -454,7 +477,8 @@ internal sealed class Dashboard : Form
                 b.BackColor = on ? Accent : Color.FromArgb(240, 241, 244); b.ForeColor = on ? Color.White : Color.Black;
                 b.Enabled = found;
             }
-            _switch.Text = input == _host.MacPort ? "⇆  Switch to this PC" : "⇆  Switch to the Mac";
+            _switch.Text = _host.MonitorShowsMac ? "⇆  Switch to this PC" : "⇆  Switch to the Mac";
+            _shownShowsMac = _host.MonitorShowsMac;
             _switch.Enabled = found; _switch.Visible = TargetIsShared;
             Set(_autoDetect, Vcp.AutoDetect, v => v == 2);
             Set(_mute, Vcp.Mute, v => v == 1);
@@ -479,9 +503,12 @@ internal sealed class Dashboard : Form
             // and ticking one of them would move the mark to the wrong monitor.
             // A marked monitor may be absent (swapped, off, at the other desk) — the tick box STAYS available then,
             // because ticking adds this monitor to the marked ones instead of moving a single mark to the wrong one.
-            bool markedMissing = _host.SharedMonitorKeys.Count > 0 && !_monitors.Any(m => _host.SharedMonitorKeys.Contains(m.Key));
+            // "Missing" only if monitors DID answer and none of them is marked; nothing answering is "silent", not missing.
+            bool markedMissing = _monitors.Count > 0 && _host.SharedMonitorKeys.Count > 0
+                                 && !_monitors.Any(m => _host.SharedMonitorKeys.Contains(m.Key));
             _pickRow.Visible = several;
-            _isShared.Visible = (several || _host.SharesMonitorWithMac) && !_host.SharedDisplayOff;
+            // No monitor answered → nothing to tick (it would not stay ticked).
+            _isShared.Visible = (several || _host.SharesMonitorWithMac) && !_host.SharedDisplayOff && _monitors.Count > 0;
             _isShared.Text = _host.SharesMonitorWithMac
                 ? "This is the monitor connected to the Mac (shortcuts and keyboard sharing use it)"
                 : "Shortcuts use this monitor";
@@ -584,6 +611,21 @@ internal sealed class Dashboard : Form
         }
     }
 
+    /// Switch button and input highlight from what both computers announced (no DDC). Only for the shared monitor.
+    private void ShowAnnouncedInput()
+    {
+        if (!TargetIsShared) return;
+        bool mac = _host.MonitorShowsMac;
+        _shownShowsMac = mac;
+        _switch.Text = mac ? "⇆  Switch to this PC" : "⇆  Switch to the Mac";
+        var shows = mac ? _host.MacPort : _host.PcPort;
+        foreach (var b in _inputButtons)
+        {
+            bool on = (byte)b.Tag! == shows;
+            b.BackColor = on ? Accent : Color.FromArgb(240, 241, 244); b.ForeColor = on ? Color.White : Color.Black;
+        }
+    }
+
     private void SwitchTo(byte code)
     {
         if (TargetIsShared) _host.SwitchInput(code);
@@ -621,7 +663,16 @@ internal sealed class Dashboard : Form
         _refreshQueued = true;
         var wait = Math.Max(0, 300 - (Num.NowMs - _lastRefresh));
         var t = new System.Windows.Forms.Timer { Interval = (int)Math.Max(1, wait) };
-        t.Tick += (_, _) => { t.Stop(); t.Dispose(); _refreshQueued = false; _lastRefresh = Num.NowMs; if (!IsDisposed) RefreshSharing(); };
+        t.Tick += (_, _) =>
+        {
+            t.Stop(); t.Dispose(); _refreshQueued = false; _lastRefresh = Num.NowMs;
+            if (IsDisposed) return;
+            RefreshSharing();
+            // The monitor was switched (from here, the Mac, or a shortcut): show it — from what both computers
+            // announced, WITHOUT reading the monitor (it is often silent for seconds right after a switch, and
+            // reading all its settings then blocked the shortcut: 2026-10-30 20:55–20:57).
+            if (_shownShowsMac is { } was && was != _host.MonitorShowsMac) ShowAnnouncedInput();
+        };
         t.Start();
     }
 

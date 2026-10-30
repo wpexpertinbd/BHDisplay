@@ -62,6 +62,8 @@ final class DDCWorker {
     /// monitor is found when they are sent (hot-plug between reading and writing).
     private var expected: MonitorIdentity?
     private let lock = NSLock()
+    /// The monitor (EDID vendor + product) the last full refresh talked to — to find its display again.
+    var expectedIdentity: MonitorIdentity? { lock.lock(); defer { lock.unlock() }; return expected }
     private var pending: [UInt8: (value: UInt16, repeats: Int, target: MonitorIdentity?)] = [:]
     private var order: [UInt8] = []
     private var scheduled = false
@@ -184,6 +186,9 @@ final class MonitorModel: ObservableObject {
     /// When each feature was last changed from the app. A refresh that started earlier must not
     /// overwrite it with the value it read before the change.
     private var lastLocalChange: [UInt8: Date] = [:]
+    /// When the monitor's input last changed (by us or the other computer). For several seconds afterwards the monitor
+    /// is often silent on DDC, so a failed read then is expected — not an error to show the user.
+    private var lastInputChange = Date.distantPast
 
     private func send(_ code: UInt8, _ value: UInt16, repeats: Int = 1, delay: Double = 0.05) {
         lastLocalChange[code] = Date()
@@ -220,7 +225,16 @@ final class MonitorModel: ObservableObject {
         io.read(codes, info: full) { [weak self] v, mi, err in
             guard let self else { return }
             self.loading = false
-            self.error = err
+            // A failed read in the monitor's known silent window after an input change is expected; it is shown only
+            // if it outlasts that window (2026-10-30: "I2C write failed" right after a switch looked like a fault).
+            let quiet = err != nil && Date().timeIntervalSince(self.lastInputChange) < 12
+            self.error = quiet ? nil : err
+            if quiet {      // read again once the window is over, so a failure that really persists is still shown
+                self.errorRecheck?.cancel()
+                let w = DispatchWorkItem { [weak self] in self?.refresh(full: false) }
+                self.errorRecheck = w
+                DispatchQueue.main.asyncAfter(deadline: .now() + max(0.5, 12.5 - Date().timeIntervalSince(self.lastInputChange)), execute: w)
+            }
             if let mi { self.info = mi }
             // Drop readings of anything the user changed while this refresh was in flight.
             var v = v
@@ -295,6 +309,10 @@ final class MonitorModel: ObservableObject {
     }
     @Published private(set) var macDisplayOff = false
     private var turnOffCheck: DispatchWorkItem?
+    /// Identifies the current turn-off confirmation chain: a chain that is no longer the current one stops itself
+    /// (its DDC read may already be in flight when a newer one is scheduled, and that cannot be cancelled).
+    private var turnOffChain = 0
+    private var errorRecheck: DispatchWorkItem?
 
     /// Set by sharing: hands a switch to the OTHER computer's input over to that computer (it may have to turn
     /// its output to the monitor on first). Returns false when there is no connection — then we switch ourselves.
@@ -359,6 +377,7 @@ final class MonitorModel: ObservableObject {
 
     private func performSwitch(_ code: UInt16) {
         switchGen += 1
+        lastInputChange = Date()
         let gen = switchGen
         if let cur = input, MonitorInput.isValid(cur), cur != code, cur != macInput { otherInput = cur }
         input = code
@@ -371,7 +390,10 @@ final class MonitorModel: ObservableObject {
             self?.io.read([VCP.input], info: false) { r, _, _ in
                 guard let self, gen == self.switchGen, let now = r[VCP.input]?.current else { return }
                 self.input = now & 0xFF
-                if now & 0xFF != code { self.realSwitch.send(now & 0xFF) }       // bounced: tell the other computer
+                if now & 0xFF != code {
+                    self.realSwitch.send(now & 0xFF)          // bounced: tell the other computer
+                    self.turnOffCheck?.cancel(); self.turnOffChain += 1   // and never turn our output off for it
+                }
                 if now & 0xFF != code {
                     let text = "\(MonitorInput.name(for: code)) has no picture — the computer on it is asleep or off, so the monitor's Auto Detect went back to \(MonitorInput.name(for: now)). Turn Auto Detect off to stay on it."
                     self.notice = text
@@ -412,25 +434,73 @@ final class MonitorModel: ObservableObject {
 
     func scheduleTurnOff(for code: UInt16) {
         turnOffCheck?.cancel()
+        turnOffChain += 1                 // an older chain whose read is still in flight stops at its next step
         guard turnOffWhenOther, DisplayPower.available, !macDisplayOff, peerConnected() else { return }
-        let gen = switchGen
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, gen == self.switchGen else { return }
-            self.io.read([VCP.input], info: false) { r, _, _ in
-                guard gen == self.switchGen, self.turnOffWhenOther, self.peerConnected(), let now = r[VCP.input]?.current, now & 0xFF == code,
-                      code != self.macInput, let id = self.info.displayID else { return }
-                if DisplayPower.turnOff(id) {
-                    self.macDisplayOff = true
-                    self.io.reset()
-                }
-            }
-        }
+        let gen = switchGen, chain = turnOffChain
+        let work = DispatchWorkItem { [weak self] in self?.confirmAndTurnOff(code: code, gen: gen, chain: chain, attempt: 0) }
         turnOffCheck = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
     }
 
+    /// Turns our output off only once the monitor has STAYED on the other computer: two answers in a row, a second
+    /// apart, that it shows the other computer's input. Right after an input change this monitor is often silent on
+    /// DDC for several seconds (the read's request write fails — "I2C write failed"), and an early answer can still
+    /// name the input it just left; so neither silence nor one odd reading decides — ask again once a second, for up
+    /// to 12 s. Two answers in a row are also what a passing Auto Detect scan cannot give. A newer switch, a switch
+    /// back, sharing off or the peer gone stops it at once (the guards below). Every way out is logged.
+    /// (2026-10-30 20:31:05 / 20:39:30 / 20:40:26: one read decided, and the output stayed on.)
+    private func confirmAndTurnOff(code: UInt16, gen: Int, chain: Int, attempt: Int, inARow: Int = 0) {
+        guard gen == switchGen, chain == turnOffChain, turnOffWhenOther, peerConnected(), !macDisplayOff else { return }
+        io.read([VCP.input], info: false) { [weak self] r, _, _ in
+            guard let self, gen == self.switchGen, chain == self.turnOffChain, self.turnOffWhenOther, self.peerConnected(),
+                  !self.macDisplayOff else { return }
+            // While this Mac's displays sleep its DDC input readings are not trustworthy (2026-10-04), and a monitor
+            // scanning its inputs could answer the other computer's input twice by chance: such readings never count.
+            let awake = CGDisplayIsAsleep(CGMainDisplayID()) == 0
+            let now = awake ? r[VCP.input].map { $0.current & 0xFF } : nil
+            let streak = now == code ? inARow + 1 : 0
+            if streak >= 2 {
+                // The display id remembered from the last full refresh can be missing or outdated: turning our output
+                // back on makes macOS bring the monitor back under a NEW id, and the refresh straight after that runs
+                // before it is back, so it remembers none (2026-10-30 20:56:00 — and every failed turn-off that day
+                // followed a turn-on). Use it only if it is still a live display; else find the monitor again (cheap,
+                // no DDC) and remember the fresh id for everything else that uses it.
+                // Found again only by THIS monitor's EDID vendor + product (the same match every refresh uses) — never
+                // "any external display" when the monitor's identity isn't known yet: then refuse, don't guess.
+                let fresh: CGDirectDisplayID? = {
+                    if let cached = self.info.displayID, DisplayPower.isActive(cached) { return cached }
+                    guard let ident = self.io.expectedIdentity else { return nil }
+                    return MonitorInfo.displayID(identity: ident)
+                }()
+                guard code != self.macInput, let id = fresh else {
+                    ShareLog.write("not turning the Mac display off: this Mac can't tell which display the monitor is")
+                    return
+                }
+                self.info.displayID = id
+                if DisplayPower.turnOff(id) {
+                    self.macDisplayOff = true
+                    self.io.reset()
+                } else {
+                    ShareLog.write("not turning the Mac display off: macOS refused to turn it off")
+                }
+                return
+            }
+            guard attempt < 12 else {
+                ShareLog.write("not turning the Mac display off: in 12 s the monitor answered " +
+                               (now.map { MonitorInput.name(for: $0) } ?? "nothing") + ", not " + MonitorInput.name(for: code) + " twice in a row")
+                return
+            }
+            let retry = DispatchWorkItem { [weak self] in
+                self?.confirmAndTurnOff(code: code, gen: gen, chain: chain, attempt: attempt + 1, inARow: streak)
+            }
+            self.turnOffCheck = retry                       // turnSharedDisplayOn() still cancels it
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: retry)
+        }
+    }
+
     func turnSharedDisplayOn() {
         turnOffCheck?.cancel()
+        turnOffChain += 1
         guard macDisplayOff else { return }
         DisplayPower.turnOn()
         macDisplayOff = false
@@ -449,6 +519,7 @@ final class MonitorModel: ObservableObject {
         guard MonitorInput.isValid(code) else { return }
         peerSwitchFallback?.cancel(); peerSwitchFallback = nil      // the other computer did it
         switchGen += 1                        // supersede any pending re-check of an older switch
+        lastInputChange = Date()
         input = code
         notice = nil
         if code == macInput { turnSharedDisplayOn() }      // self-heal: the monitor is on us, so we must output

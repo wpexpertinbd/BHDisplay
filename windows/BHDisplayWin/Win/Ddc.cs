@@ -138,9 +138,10 @@ internal static partial class Ddc
             var answering = all.Where(f => GetVCPFeatureAndVCPFeatureReply(f.M.Handle, VcpInput, out _, out _, out _)).Select(f => f.M).ToList();
             OpenAllCached = answering;
             if (answering.Count == 0)
-            {   // Nothing answered DDC at all. With monitors marked, that is still "we cannot act" — say so rather
-                // than leaving a stale flag behind, or we would accept a switch we then silently fail to perform.
-                if (key is null && PreferredKeys.Length > 0) { MarkedMissing = true; }
+            {   // Nothing answered DDC at all — the monitor is silent (often for seconds after a switch), which is not
+                // the same as "the marked monitor isn't here" (2026-10-30 20:54:22 said so at start-up, wrongly).
+                // Switch requests are decided from a fresh desktop count, not from this flag.
+                if (key is null) MarkedMissing = false;
                 return default;
             }
             // Exactly one match or nothing: never act on a monitor we can't tell apart from another one.

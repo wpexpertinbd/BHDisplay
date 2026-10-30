@@ -130,11 +130,16 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         // need to ask the monitor (2026-10-05 20:15/20:20: asking it while it was switched off from Windows gave an
         // answer that wasn't the Mac's input, so Ctrl+Alt+Win+S asked the Mac for the Mac — several times).
         if (_settings.DetachedDevice.Length > 0) { Log.Write("toggle: this PC's output is off, so the monitor shows the Mac"); Switch(_settings.PcPort); return; }
-        // Otherwise read the monitor off the UI thread (the input hooks live there); no answer → what we were last told.
-        Task.Run(() => Ddc.CurrentInput()).ContinueWith(t => Post(() =>
+        // Otherwise read the monitor off the UI thread (the input hooks live there) — but never wait on it: the monitor
+        // connection can be busy (the window reading its settings, the monitor silent right after a switch), and a
+        // key press must answer at once (2026-10-30 20:55–20:57: presses queued behind the window's reads, none acted).
+        // No answer within 1 s → what both computers last announced.
+        Log.Write("toggle: pressed");
+        var read = Task.Run(() => Ddc.CurrentInput());
+        Task.WhenAny(read, Task.Delay(1000)).ContinueWith(_ => Post(() =>
         {
-            var cur = t.Status == TaskStatus.RanToCompletion ? t.Result : null;
-            Log.Write($"toggle: the monitor reads {(cur is { } c ? Ddc.NameOf(c) : "nothing")}");
+            var cur = read.Status == TaskStatus.RanToCompletion ? read.Result : null;
+            Log.Write($"toggle: the monitor reads {(cur is { } c ? Ddc.NameOf(c) : read.IsCompleted ? "nothing" : "nothing yet (busy)")}");
             bool showsMac = cur is { } v ? v == _settings.MacPort : !_showsPc;
             Switch(showsMac ? _settings.PcPort : _settings.MacPort);
         }));
@@ -170,9 +175,12 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
             _session.Send(new ShareMsg.SwitchRequest(code));
             Log.Write($"asked the Mac to switch the monitor to {Ddc.NameOf(code)}");
             var asked = _session;
+            int askedShownMac = _macShown;
             _ = Task.Delay(10000).ContinueWith(_ => Post(() =>
-            {   // no MONITOR_SHOWS answer: tell the user instead of failing silently
-                if (_session == asked && _showsPc) { Log.Write("the Mac did not switch the monitor within 10 s");
+            {   // no MONITOR_SHOWS answer: tell the user instead of failing silently. Only if NOTHING happened to the
+                // monitor since: a switch the Mac did and a newer switch after it are not "didn't switch"
+                // (2026-10-30 20:39:27: warned although the Mac had switched 10 s earlier and been switched back).
+                if (_session == asked && _macShown == askedShownMac && _showsPc) { Log.Write("the Mac did not switch the monitor within 10 s");
                     _icon.ShowBalloonTip(4000, "BHDisplay", "The Mac didn't switch the monitor. Is BHDisplay running on the Mac?", ToolTipIcon.Warning); }
             }));
             return;
@@ -221,9 +229,14 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
 
     /// "Input follows the monitor": shows the Mac → this PC's input goes to the Mac (take-over);
     /// shows this PC → keep input here, cross to the Mac at the edge facing it.
+    /// How many times the monitor was reported as showing the Mac: "the Mac didn't switch" is only true if this
+    /// did not change since we asked (repeat "shows this PC" announcements don't count).
+    private int _macShown;
+
     private void MonitorNowShows(byte code)
     {
         bool showsPc = code == _settings.PcPort;
+        if (code == _settings.MacPort) _macShown++;
         bool changed = showsPc != _showsPc;
         if (changed) { _showsPc = showsPc; Log.Write($"monitor shows {(showsPc ? "this PC" : "the Mac")} ({Ddc.NameOf(code)})"); }
         Interlocked.Increment(ref _switchGen);
@@ -490,6 +503,10 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     byte IDashboardHost.MacPort => _settings.MacPort;
     byte IDashboardHost.PcPort => _settings.PcPort;
     void IDashboardHost.SwitchInput(byte code) => Switch(code);
+    /// The window's "Switch to …" button: the same decision as Ctrl+Alt+Win+S and the tray item, never the window's
+    /// own last reading (2026-10-30 20:40:56: a stale reading made it "switch to the Mac" by switching to this PC).
+    void IDashboardHost.ToggleSharedMonitor() => ToggleMonitor();
+    bool IDashboardHost.MonitorShowsMac => MenuShowsMac(null);
     bool IDashboardHost.Sharing
     {
         get => _settings.Sharing;
@@ -980,7 +997,8 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         var t = "BHDisplay — " + _status;
         _icon.Text = t.Length > 63 ? t.Substring(0, 63) : t;
         // Only when something visible changed (this runs for every message while a mouse is in use).
-        var sig = $"{_status}|{_settings.Sharing}|{_settings.Paired.Count}|{_unpaired.Count}|{_session is not null}";
+        // (Includes what the shared monitor shows: the window's switch button must follow a switch made anywhere.)
+        var sig = $"{_status}|{_settings.Sharing}|{_settings.Paired.Count}|{_unpaired.Count}|{_session is not null}|{_showsPc}|{_settings.DetachedDevice.Length > 0}";
         if (sig != _changedSig) { _changedSig = sig; Changed?.Invoke(); }
     }
 
