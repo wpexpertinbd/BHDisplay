@@ -23,7 +23,9 @@ internal interface IDashboardHost
     double MacMouseSpeed { get; set; }
     double MacScrollSpeed { get; set; }
     bool StartWithWindows { get; set; }
-    string SharedMonitorSerial { get; set; }
+    /// Every monitor marked as also connected to the Mac (MonitorEntry.Key), so each unit is ticked once.
+    IReadOnlyList<string> SharedMonitorKeys { get; }
+    void SetSharedMonitor(string key, bool shared);
     bool TurnOffWhenMac { get; set; }
     bool SharedDisplayOff { get; }
     /// A Mac shares a monitor with this PC (it told us). Otherwise the other computer is e.g. another Windows PC.
@@ -56,10 +58,18 @@ internal sealed class Dashboard : Form
     private readonly TableLayoutPanel _pickRow = new();
     private readonly CheckBox _isShared = new();
     private List<Ddc.MonitorEntry> _monitors = new();
+    private Button? _reset;
     /// Monitor the window controls (null = the only one / the shared one).
     private string? _target;
+    /// The window landed on a monitor the user never chose: monitors are marked as connected to the Mac, none of
+    /// them is here, so the list fell back to another one. Everything is shown but nothing may be written to it
+    /// until the user picks a monitor — a slider must never change a screen they did not mean.
+    private bool _fellBack;
+    /// The monitor the user picked in the dropdown (or ticked) — never set by a fallback, so a monitor the window
+    /// merely landed on can never later look like a choice the user made.
+    private string? _userTarget;
     private bool TargetIsShared => _host.SharesMonitorWithMac &&
-        (_target is null || _target == _host.SharedMonitorSerial || (_monitors.Count <= 1 && _host.SharedMonitorSerial.Length == 0));
+        (_target is null || _host.SharedMonitorKeys.Contains(_target) || (_monitors.Count <= 1 && _host.SharedMonitorKeys.Count == 0));
     private readonly RadioButton _sideLeft = new(), _sideRight = new();
     private readonly Label _shortcuts = new();
     private readonly Button[] _inputButtons = new Button[3];
@@ -216,7 +226,7 @@ internal sealed class Dashboard : Form
         _monitorPick.SelectedIndexChanged += (_, _) =>
         {
             if (_loading || _monitorPick.SelectedIndex < 0 || _monitorPick.SelectedIndex >= _monitors.Count) return;
-            _target = _monitors[_monitorPick.SelectedIndex].Key;     // which monitor this window controls
+            _target = _userTarget = _monitors[_monitorPick.SelectedIndex].Key;     // which monitor this window controls (chosen)
             Reload();
         };
         var identify = new Button { Text = "Identify", AutoSize = true, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Left, Margin = new Padding(8, 0, 0, 0) };
@@ -228,13 +238,16 @@ internal sealed class Dashboard : Form
         _isShared.AutoSize = true; _isShared.Visible = false;
         _isShared.CheckedChanged += (_, _) =>
         {
-            if (_loading || !_isShared.Checked || _target is null) return;
-            if (!_target.StartsWith("sn:", StringComparison.Ordinal))
+            if (_loading || _target is null) return;
+            if (_isShared.Checked && !_target.StartsWith("sn:", StringComparison.Ordinal))
             {
                 MessageBox.Show(this, "This monitor doesn't report a serial number, so BHDisplay can't recognise it reliably.", "BHDisplay");
                 _loading = true; _isShared.Checked = false; _loading = false; return;
             }
-            _host.SharedMonitorSerial = _target;
+            // Each physical monitor is marked once: ticking a second monitor (the same model at another desk) ADDS it
+            // instead of moving the mark, so both are recognised wherever they are plugged in. Unticking removes one.
+            _userTarget = _target;
+            _host.SetSharedMonitor(_target, _isShared.Checked);
             Reload();
         };
         body.Controls.Add(_pickRow); body.Controls.Add(_isShared); body.Controls.Add(_pickNote);
@@ -284,7 +297,7 @@ internal sealed class Dashboard : Form
             _info[k] = v; cell.Controls.Add(v); grid.Controls.Add(cell);
         }
         body.Controls.Add(grid);
-        var reset = new Button { Text = "Reset monitor to factory settings…", AutoSize = true, FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 6, 0, 0), Padding = new Padding(10, 3, 10, 3) };
+        var reset = _reset = new Button { Text = "Reset monitor to factory settings…", AutoSize = true, FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 6, 0, 0), Padding = new Padding(10, 3, 10, 3) };
         reset.Click += (_, _) => FactoryReset();
         body.Controls.Add(reset);
         return card;
@@ -406,15 +419,19 @@ internal sealed class Dashboard : Form
     public void Reload()
     {
         _model.Text = "Reading the monitor…";
-        var want = _target; var shared = _host.SharedMonitorSerial;
+        var want = _userTarget; var shared = _host.SharedMonitorKeys.ToList();
         _ddc.Do(() =>
         {
             var list = Ddc.ListMonitors();
             string? key = list.Count == 0 ? null
-                : list.Any(m => m.Key == want) ? want : list.Any(m => m.Key == shared) ? shared : list[0].Key;
+                : list.Any(m => m.Key == want) ? want
+                : list.FirstOrDefault(m => shared.Contains(m.Key))?.Key ?? list[0].Key;
             var entry = list.FirstOrDefault(m => m.Key == key);
-            return (Ddc.ReadMany(Vcp.Panel, key), MonitorDetails.Read(entry?.Serial ?? "", entry?.Device), list, key);
-        }, r => { if (IsDisposed) return; _values = r.Item1; _details = r.Item2; _monitors = r.Item3; _target = r.Item4; Fill(); });
+            // Did we land on a monitor the user never chose? (marks exist, none of them is here, and this is not
+            // the monitor they picked in the dropdown)
+            bool fellBack = shared.Count > 0 && key != null && !shared.Contains(key) && want != key;
+            return (Ddc.ReadMany(Vcp.Panel, key), MonitorDetails.Read(entry?.Serial ?? "", entry?.Device), list, key, fellBack);
+        }, r => { if (IsDisposed) return; _values = r.Item1; _details = r.Item2; _monitors = r.Item3; _target = r.Item4; _fellBack = r.Item5; Fill(); });
     }
 
     private void Merge(Dictionary<byte, (uint Cur, uint Max)> r) { foreach (var kv in r) _values[kv.Key] = kv.Value; }
@@ -460,9 +477,11 @@ internal sealed class Dashboard : Form
             // ever turned off); without one, which of several monitors the shortcuts use.
             // Never offer the tick box while the marked monitor is off or missing: only the others are listed then,
             // and ticking one of them would move the mark to the wrong monitor.
-            bool markedMissing = _host.SharedMonitorSerial.Length > 0 && !_monitors.Any(m => m.Key == _host.SharedMonitorSerial);
+            // A marked monitor may be absent (swapped, off, at the other desk) — the tick box STAYS available then,
+            // because ticking adds this monitor to the marked ones instead of moving a single mark to the wrong one.
+            bool markedMissing = _host.SharedMonitorKeys.Count > 0 && !_monitors.Any(m => _host.SharedMonitorKeys.Contains(m.Key));
             _pickRow.Visible = several;
-            _isShared.Visible = (several || _host.SharesMonitorWithMac) && !_host.SharedDisplayOff && !markedMissing;
+            _isShared.Visible = (several || _host.SharesMonitorWithMac) && !_host.SharedDisplayOff;
             _isShared.Text = _host.SharesMonitorWithMac
                 ? "This is the monitor connected to the Mac (shortcuts and keyboard sharing use it)"
                 : "Shortcuts use this monitor";
@@ -472,23 +491,25 @@ internal sealed class Dashboard : Form
                 var m = _monitors[i];
                 var side = _monitors.Count == 2 ? (i == 0 ? " (left)" : " (right)") : "";
                 _monitorPick.Items.Add($"Monitor {i + 1}{side} · serial {(m.Serial.Length > 0 ? Serial(m.Serial) : "unknown")}" +
-                                       (_host.SharesMonitorWithMac && m.Key == _host.SharedMonitorSerial ? "  —  connected to the Mac" : ""));
+                                       (_host.SharesMonitorWithMac && _host.SharedMonitorKeys.Contains(m.Key) ? "  —  connected to the Mac" : ""));
             }
             int shown = _monitors.FindIndex(m => m.Key == _target);
             _monitorPick.SelectedIndex = several ? shown : -1;
-            bool sharedChosen = _monitors.Any(m => m.Key == _host.SharedMonitorSerial);
-            _pickNote.Visible = several && !sharedChosen && !_host.SharedDisplayOff;
-            _pickNote.Text = _host.SharesMonitorWithMac
-                ? "This PC has more than one monitor. Choose the one that is also connected to the Mac and tick the box below."
-                : "This PC has more than one monitor. Choose the one the shortcuts should switch and tick the box below.";
+            bool sharedChosen = _monitors.Any(m => _host.SharedMonitorKeys.Contains(m.Key));
+            _pickNote.Visible = (several || markedMissing) && !sharedChosen && !_host.SharedDisplayOff;
+            _pickNote.Text = !_host.SharesMonitorWithMac
+                ? "This PC has more than one monitor. Choose the one the shortcuts should switch and tick the box below."
+                : markedMissing
+                ? "The monitor marked as connected to the Mac isn't here. If you swapped it for another one, choose this monitor and tick the box below — the one at your other desk stays marked too."
+                : "This PC has more than one monitor. Choose the one that is also connected to the Mac and tick the box below.";
             _turnOff.Visible = _host.SharesMonitorWithMac && (several || _host.SharedDisplayOff);
             _shortcuts.Text = _host.SharesMonitorWithMac
                 ? "Shortcuts:  Ctrl+Alt+Win+S  Mac ⇄ this PC     Ctrl+Alt+Win+1 / 2 / 3  DisplayPort / HDMI 1 / HDMI 2"
                 : "Shortcuts:  Ctrl+Alt+Win+1 / 2 / 3  DisplayPort / HDMI 1 / HDMI 2";
             if (_host.SharedDisplayOff)
                 _via.Text = "The monitor connected to the Mac is showing the Mac — Windows' output to it is off until you switch back.";
-            _isShared.Checked = sharedChosen && _target == _host.SharedMonitorSerial;
-            _isShared.Enabled = !_isShared.Checked;
+            _isShared.Checked = _target is not null && _host.SharedMonitorKeys.Contains(_target);
+            _isShared.Enabled = true;        // can be unticked too: marks are a list, not one choice
             var target = shown >= 0 ? _monitors[shown] : null;
             _info["Serial Number"].Text = Serial(target?.Serial is { Length: > 0 } ss ? ss : _details.Serial);
             _info["Monitor Name"].Text = _details.Name;
@@ -496,6 +517,22 @@ internal sealed class Dashboard : Form
             _info["Resolution"].Text = _details.Resolution;
             _info["PC Connection"].Text = Ddc.NameOf(_host.PcPort);
             _info["Manufactured"].Text = _details.Manufactured;
+            // The window landed on a monitor nobody chose: let it be read, never written, until a monitor is picked.
+            // Every control above sets its own Enabled from the values it just read, so this gate is applied last.
+            // These two are not re-derived by the code above, so set them every time (else a past fallback would
+            // leave them disabled after the user has chosen a monitor).
+            _userColor.Enabled = !_fellBack;
+            if (_reset is not null) _reset.Enabled = !_fellBack;
+            if (_fellBack)
+            {
+                foreach (var kv in _sliders) kv.Value.Bar.Enabled = false;
+                _viewMode.Enabled = _colorTemp.Enabled = false;
+                _autoDetect.Enabled = _mute.Enabled = _switch.Enabled = false;
+                foreach (var b in _inputButtons) b.Enabled = false;
+                _via.Text = "Showing " + _details.Name + " — the monitor marked as connected to the Mac isn't here. " + (several
+                    ? "Choose a monitor above, or tick the box below if this one is connected to the Mac."
+                    : "Tick the box below if this monitor is connected to the Mac.");
+            }
         }
         finally { _loading = false; }
         RefreshSharing();

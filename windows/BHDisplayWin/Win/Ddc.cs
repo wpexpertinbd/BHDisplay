@@ -19,11 +19,15 @@ internal static partial class Ddc
         public string Key => Serial.Length > 0 ? "sn:" + Serial : "dev:" + Device;
     }
 
-    /// Serial (EDID) of the monitor that is also connected to the Mac, chosen by the user when the PC has more than
-    /// one monitor that answers DDC. Empty = not chosen.
-    public static string PreferredSerial = "";
-    /// True after the last lookup found several monitors and none matched PreferredSerial (the user must choose).
+    /// The monitors the user marked as also connected to the Mac, by MonitorEntry.Key ("sn:<EDID serial>"). It is a
+    /// LIST so a second monitor of the same model (one at the office, one at home) is marked once and then recognised
+    /// in both places — a replacement unit has a different serial. Empty = none marked.
+    public static volatile string[] PreferredKeys = new string[0];
+    /// True after the last lookup found several monitors and none is marked (the user must choose).
     public static volatile bool NeedsChoice;
+    /// True after the last lookup found no marked monitor among the ones that answered — a marked monitor is off,
+    /// unplugged, or was swapped for another unit. Nothing is acted on; the user is told to mark this one too.
+    public static volatile bool MarkedMissing;
 
     private static List<(MonitorEntry M, PHYSICAL_MONITOR[] Arr)> OpenAll()
     {
@@ -44,7 +48,36 @@ internal static partial class Ddc
     }
 
     /// EDID serial number of the monitor on a display (\\.\DISPLAYn), read from the registry copy of its EDID.
-    private static string EdidSerial(string device)
+    /// How many monitors on Windows' desktop RIGHT NOW are marked as connected to the Mac. user32 + registry only, no
+    /// DDC, so it takes milliseconds: a switch request from the Mac is answered from a fresh count instead of whatever
+    /// the last DDC lookup happened to leave behind (a mark just ticked, or a monitor just plugged back in).
+    /// A monitor whose output we turned off is not on the desktop — callers only ask while nothing is turned off.
+    public static int MarkedOnDesktop(string[] marked)
+    {
+        if (marked.Length == 0) return 0;
+        // Counted exactly the way OpenAll() builds its list — one entry per PHYSICAL monitor behind each HMONITOR, all
+        // carrying that display's EDID serial — so this count and Choose() can never disagree (e.g. cloned displays:
+        // two physical monitors behind one HMONITOR count as two, which Choose() also sees as ambiguous).
+        var found = new List<(string Device, uint Physical)>();
+        EnumDisplayMonitors(0, 0, (nint m, nint _, ref RECT _, nint _) =>
+        {
+            var mi = new MONITORINFOEX { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<MONITORINFOEX>() };
+            if (GetNumberOfPhysicalMonitorsFromHMONITOR(m, out var count) && count > 0
+                && GetMonitorInfoEx(m, ref mi) && !string.IsNullOrEmpty(mi.szDevice))
+                found.Add((mi.szDevice, count));
+            return true;
+        }, 0);
+        int n = 0;
+        foreach (var (device, physical) in found)
+        {
+            var sn = EdidSerial(device);
+            if (sn.Length > 0 && marked.Contains("sn:" + sn, StringComparer.Ordinal)) n += (int)physical;
+        }
+        return n;
+    }
+
+    /// Reads from the registry only — no DDC traffic — so it is safe to call on the UI thread.
+    public static string EdidSerial(string device)
     {
         try
         {
@@ -104,7 +137,12 @@ internal static partial class Ddc
         {
             var answering = all.Where(f => GetVCPFeatureAndVCPFeatureReply(f.M.Handle, VcpInput, out _, out _, out _)).Select(f => f.M).ToList();
             OpenAllCached = answering;
-            if (answering.Count == 0) return default;
+            if (answering.Count == 0)
+            {   // Nothing answered DDC at all. With monitors marked, that is still "we cannot act" — say so rather
+                // than leaving a stale flag behind, or we would accept a switch we then silently fail to perform.
+                if (key is null && PreferredKeys.Length > 0) { MarkedMissing = true; }
+                return default;
+            }
             // Exactly one match or nothing: never act on a monitor we can't tell apart from another one.
             MonitorEntry? Only(string k) { var ms = answering.Where(x => x.Key == k).ToList(); return ms.Count == 1 ? ms[0] : null; }
             if (key is not null)
@@ -112,13 +150,23 @@ internal static partial class Ddc
                 var m = Only(key);
                 return m is null ? default : action(m.Handle, m.Desc);
             }
-            if (PreferredSerial.Length > 0)
+            // Which monitor may be acted on (rules + tests in Core/MonitorMarks.cs).
+            switch (BHDisplay.Core.MonitorMarks.Choose(answering.Select(x => x.Key).ToList(), PreferredKeys, out var pick))
             {
-                // A monitor was chosen: use it, or refuse (it may be off/unplugged) — never fall back to another one.
-                NeedsChoice = false;
-                var chosen = Only(PreferredSerial);
-                return chosen is null ? default : action(chosen.Handle, chosen.Desc);
+                case BHDisplay.Core.MarkChoice.Chosen:
+                    NeedsChoice = false; MarkedMissing = false;
+                    var m2 = answering.First(x => x.Key == pick);
+                    return action(m2.Handle, m2.Desc);
+                case BHDisplay.Core.MarkChoice.Missing:
+                    NeedsChoice = false; MarkedMissing = true;      // swapped, off, or at the other desk
+                    return default;
+                case BHDisplay.Core.MarkChoice.Ambiguous:
+                    // Both marked monitors are here (both desks' monitors on one PC): never pick the wrong one — but
+                    // this is still "we cannot act", so a switch request must be declined, not accepted and dropped.
+                    NeedsChoice = false; MarkedMissing = false;
+                    return default;
             }
+            MarkedMissing = false;
             NeedsChoice = answering.Count > 1;
             if (answering.Count > 1) return default;          // several and none chosen: ask, don't guess
             return action(answering[0].Handle, answering[0].Desc);
@@ -157,11 +205,16 @@ internal sealed class Settings
     public Dictionary<string, string> PeerHosts { get; set; } = new();   // fingerprint → last IPv4 the peer was reached at
     public byte MacPort { get; set; } = 0x12;              // updated from the Mac (MONITOR_PORTS)
     public byte PcPort { get; set; } = 0x0F;
-    public string SharedMonitorSerial { get; set; } = "";   // which of several monitors is also on the Mac
+    public string SharedMonitorSerial { get; set; } = "";   // legacy single choice; migrated into SharedMonitorKeys
+    public List<string> SharedMonitorKeys { get; set; } = new();   // every monitor marked as also connected to the Mac
     public bool Logging { get; set; } = true;               // "Keep a Log"
     public int LogKeepDays { get; set; } = 7;               // delete log entries older than 3 or 7 days
     public bool TurnOffWhenMac { get; set; } = true;      // turn Windows' output to the shared monitor off while it shows the Mac
     public string DetachedDevice { get; set; } = "";
+    /// WHICH monitor was turned off, not just which display slot (\\.\DISPLAYn). A slot is reused by whatever
+    /// monitor is plugged into that port, so without this the saved resolution/refresh of the monitor we turned
+    /// off could be forced onto a different monitor later — and written into the registry.
+    public string DetachedKey { get; set; } = "";
     public string RestorePrimary { get; set; } = "";       // was the main display before we turned it off       // set while we have it off (restored at start if we crashed)
     public int DetachedX { get; set; } public int DetachedY { get; set; }
     public int DetachedW { get; set; } public int DetachedH { get; set; } public int DetachedHz { get; set; }
@@ -177,12 +230,17 @@ internal sealed class Settings
         {
             var s = new JavaScriptSerializer().Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new();
             s.Paired ??= new(); s.PeerHosts ??= new();
+            // Carries a single mark from an older build into the list, drops anything malformed, caps the count.
+            s.SharedMonitorKeys = BHDisplay.Core.MonitorMarks.Normalise(s.SharedMonitorKeys, s.SharedMonitorSerial);
+            s.SharedMonitorSerial = s.SharedMonitorKeys.FirstOrDefault() ?? "";
             if (!Ddc.IsInput(s.MacPort)) s.MacPort = 0x12;    // never trust a hand-edited value
             if (!Ddc.IsInput(s.PcPort)) s.PcPort = 0x0F;
             if (s.MacEdge is not (0 or 1)) s.MacEdge = 0;
             s.DetachedDevice ??= ""; s.RestorePrimary ??= "";
             if (s.RestorePrimary.Length > 0 && !System.Text.RegularExpressions.Regex.IsMatch(s.RestorePrimary, @"^\\\\\.\\DISPLAY\d{1,3}$")) s.RestorePrimary = "";
             if (s.DetachedDevice.Length > 0 && !System.Text.RegularExpressions.Regex.IsMatch(s.DetachedDevice, @"^\\\\\.\\DISPLAY\d{1,3}$")) s.DetachedDevice = "";
+            s.DetachedKey ??= "";
+            if (s.DetachedKey.Length > 0 && !BHDisplay.Core.MonitorMarks.IsKey(s.DetachedKey)) s.DetachedKey = "";
             s.MacMouseSpeed = double.IsNaN(s.MacMouseSpeed) ? 1 : Math.Max(0.5, Math.Min(3, s.MacMouseSpeed));
             s.MacScrollSpeed = double.IsNaN(s.MacScrollSpeed) ? 1 : Math.Max(0.5, Math.Min(5, s.MacScrollSpeed));
             s.Paired = s.Paired.Where(kv => kv.Key.Length == 64 && kv.Key.All(Uri.IsHexDigit)).ToDictionary(kv => kv.Key, kv => kv.Value);

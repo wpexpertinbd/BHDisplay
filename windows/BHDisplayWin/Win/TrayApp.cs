@@ -64,7 +64,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
 
         _capture.Edge = _emu.Edge = _settings.MacEdge;
         _emu.Speed = _settings.MacMouseSpeed; _emu.ScrollSpeed = _settings.MacScrollSpeed;
-        Ddc.PreferredSerial = _settings.SharedMonitorSerial ?? "";
+        Ddc.PreferredKeys = _settings.SharedMonitorKeys.ToArray();
         Log.Enabled = _settings.Logging;
         _capture.EdgeHit = pos => EdgeHit(pos);
         _capture.Captured = m => { if (_controlling) _session?.Send(m); };
@@ -101,11 +101,19 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         Log.Write("tray ready: " + _status);
         RefreshMenuMonitor();                                   // so the first right-click already shows the monitor
         // Several monitors answer DDC and none is chosen yet: ask once which one is connected to the Mac.
-        Task.Run(() => { Ddc.CurrentInput(); return Ddc.NeedsChoice; }).ContinueWith(t =>
+        Task.Run(() => { Ddc.CurrentInput(); return (Ddc.NeedsChoice, Ddc.MarkedMissing); }).ContinueWith(t =>
         {
-            if (t.Status == TaskStatus.RanToCompletion && t.Result)
+            if (t.Status != TaskStatus.RanToCompletion) return;
+            var (needsChoice, missing) = t.Result;
+            if (needsChoice)
                 Post(() => _icon.ShowBalloonTip(8000, "BHDisplay — choose your monitor",
                     "This PC has more than one monitor. Click the BHDisplay icon and choose the one that is also connected to the Mac.", ToolTipIcon.Info));
+            else if (missing)
+            {   // A marked monitor was swapped for another unit (a different EDID serial): one tick fixes it for good.
+                Log.Write("no monitor marked as connected to the Mac is here");
+                Post(() => _icon.ShowBalloonTip(10000, "BHDisplay — tick your monitor",
+                    "The monitor marked as connected to the Mac isn't here. If you swapped it for another one, click the BHDisplay icon, choose this monitor and tick it as connected to the Mac.", ToolTipIcon.Warning));
+            }
         });
     }
 
@@ -136,6 +144,20 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     private int _offGen;                    // bumped by a disconnect / sharing off: cancels a pending turn-off only
     private bool _switching;                // one local switch at a time
     private long _lastPeerRequest;
+    private long _lastMissingWarn;
+
+    /// How many marked monitors Windows has on its desktop right now (-1 = nothing is marked). Counted FRESH on every
+    /// request — user32 + registry, milliseconds, no DDC — never taken from an earlier lookup, which can be stale in
+    /// both directions (a mark just ticked, a monitor just plugged in or out).
+    private int MarkedHere() =>
+        _settings.SharedMonitorKeys.Count == 0 ? -1 : Ddc.MarkedOnDesktop(_settings.SharedMonitorKeys.ToArray());
+
+    /// True when monitors are marked but we cannot act on exactly one of them — none of them is here (swapped,
+    /// unplugged, at the other desk) or two are here at once — AND we are not holding an output off, so the Mac
+    /// switching the monitor by itself is safe: our output to it is still attached and the monitor sees a signal.
+    /// (With our output off the monitor is not on the desktop at all, which is why that case never declines.)
+    private bool CannotReachSharedMonitor(int markedHere) =>
+        markedHere >= 0 && markedHere != 1 && _settings.DetachedDevice.Length == 0;
 
     private void Switch(byte code)
     {
@@ -158,6 +180,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         if (_switching) return;
         _switching = true;
         _offTimer?.Stop();
+        ForgetDetachedIfSwapped();
         bool turnOn = code == _settings.PcPort && _settings.DetachedDevice.Length > 0;
         int myGen = Volatile.Read(ref _switchGen);
         var det = (_settings.DetachedDevice, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
@@ -182,7 +205,9 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                 Log.Write($"switch to {Ddc.NameOf(code)} failed" + (turnOn ? $" (output on: {on}; {DisplayPower.LastError})" : ""));
                 var why = turnOn ? "The monitor didn't come back — try again."
                     : Ddc.NeedsChoice ? "This PC has several monitors — click the BHDisplay icon and choose the one connected to the Mac."
-                    : Ddc.PreferredSerial.Length > 0 ? "The monitor connected to the Mac isn't answering. Is it on, with Setup Menu ▸ DDC/CI ▸ On?"
+                    : Ddc.MarkedMissing ? "The monitor marked as connected to the Mac isn't here. If you swapped it for another one, click the BHDisplay icon and tick this monitor as connected to the Mac."
+                    : MarkedHere() > 1 ? "Several monitors are marked as connected to the Mac and more than one is plugged in. Click the BHDisplay icon and untick the one that is not on the Mac here."
+                    : Ddc.PreferredKeys.Length > 0 ? "The monitor connected to the Mac isn't answering. Is it on, with Setup Menu ▸ DDC/CI ▸ On?"
                     : "Couldn't switch the monitor. Turn on Setup Menu ▸ DDC/CI on the monitor.";
                 _icon.ShowBalloonTip(4000, "BHDisplay", why, ToolTipIcon.Warning);
                 return;
@@ -260,7 +285,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         if (!_settings.TurnOffWhenMac || _settings.DetachedDevice.Length > 0 || _session is null || !_peerSharesMonitor) return;
         // Only the monitor the user marked as connected to the Mac is ever turned off — never one BHDisplay guessed
         // (a PC paired with a Mac but on another monitor would otherwise lose a screen it is using).
-        if ((_settings.SharedMonitorSerial ?? "").Length == 0) { Log.Write("not turning a monitor off: none is marked as connected to the Mac"); return; }
+        if (_settings.SharedMonitorKeys.Count == 0) { Log.Write("not turning a monitor off: none is marked as connected to the Mac"); return; }
         _offTimer ??= new System.Windows.Forms.Timer { Interval = 6000 };
         _offTimer.Stop();
         _offTimer.Tick -= OffTick; _offTimer.Tick += OffTick;
@@ -299,6 +324,13 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                                          : $"not turning the monitor off: it shows {(input is { } i ? Ddc.NameOf(i) : "nothing readable")}");
                 return;
             }
+            // The marks may have changed while we were reading (the worker ran for up to 12 s): only ever turn off a
+            // monitor that is marked as connected to the Mac RIGHT NOW.
+            if (!_settings.SharedMonitorKeys.Contains(shared.Key))
+            {
+                Log.Write($"not turning the monitor off: {shared.Key} is no longer marked as connected to the Mac");
+                return;
+            }
             var device = shared.Device;
             // All display changes off the UI thread (the keyboard/mouse hooks live there).
             Task.Run(() =>
@@ -334,9 +366,10 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                 _ui.Send(_ =>
                 {
                     stillWanted = Wanted() && !_showsPc && _settings.DetachedDevice.Length == 0 && _settings.TurnOffWhenMac
-                                  && _session is not null && _peerSharesMonitor;
+                                  && _session is not null && _peerSharesMonitor && _settings.SharedMonitorKeys.Contains(shared.Key);
                     if (!stillWanted) return;
                     _settings.DetachedDevice = device;
+                    _settings.DetachedKey = shared.Key;        // which MONITOR, so its mode is never forced onto another one
                     (_settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz) = l;
                     _settings.Save();
                 }, null);
@@ -347,17 +380,36 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                 Post(() =>
                 {
                     if (off) Log.Write($"this PC's output to the monitor turned off ({device})");
-                    else { Log.Write("not turning the monitor off after all (switched back, or Windows refused)"); if (_settings.DetachedDevice == device) { _settings.DetachedDevice = ""; _settings.Save(); } }
+                    else { Log.Write("not turning the monitor off after all (switched back, or Windows refused)"); if (_settings.DetachedDevice == device) { _settings.DetachedDevice = ""; _settings.DetachedKey = ""; _settings.Save(); } }
+                    // Unticked in the instant between the last check and Windows applying it (the display lock can't be
+                    // taken here: the input hooks live on this thread). Only a marked monitor may stay off: undo it.
+                    if (off && !_settings.SharedMonitorKeys.Contains(shared.Key)) RestoreOutput("unmarked while it was being turned off");
                     Changed?.Invoke();
                 });
             });
         }));
     }
 
+    /// The display slot we turned off (\\.\DISPLAYn) may now hold a DIFFERENT monitor: ours was unplugged and another
+    /// one plugged into the same port (monitors moved between desks). Then there is nothing of ours to turn back on,
+    /// and forcing the saved resolution/refresh onto the newcomer would change a monitor we never touched — and write
+    /// it to the registry. Registry read only (no DDC), so it is fine on the UI thread. Can't tell (no serial, or no
+    /// record of which monitor it was, e.g. turned off by an older build) → everything behaves exactly as before.
+    private void ForgetDetachedIfSwapped()
+    {
+        if (_settings.DetachedDevice.Length == 0 || _settings.DetachedKey.Length == 0) return;
+        var now = Ddc.EdidSerial(_settings.DetachedDevice);
+        if (now.Length == 0 || "sn:" + now == _settings.DetachedKey) return;
+        Log.Write($"{_settings.DetachedDevice} is now another monitor (sn:{now}, turned off: {_settings.DetachedKey}) — leaving it as Windows has it");
+        _settings.DetachedDevice = ""; _settings.DetachedKey = ""; _settings.Save();
+        Changed?.Invoke();
+    }
+
     /// Synchronous: only at start-up and quit (no keyboard/mouse forwarding in progress then).
     private void TurnSharedDisplayOn()
     {
         _offTimer?.Stop();
+        ForgetDetachedIfSwapped();
         if (_settings.DetachedDevice.Length == 0) return;
         var device = _settings.DetachedDevice;
         bool ok = DisplayPower.TurnOn(device, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
@@ -386,7 +438,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         Log.Write(ok ? $"this PC's output to the monitor turned on ({device}; {DisplayPower.LastError})"
                      : $"couldn't turn this PC's output to the monitor back on ({DisplayPower.LastError})");
         // Done — or that display no longer exists at all (renumbered/removed): stop trying, never get stuck "off".
-        if (ok || !DisplayPower.Exists(device)) { _settings.DetachedDevice = ""; _settings.Save(); }
+        if (ok || !DisplayPower.Exists(device)) { _settings.DetachedDevice = ""; _settings.DetachedKey = ""; _settings.Save(); }
         Changed?.Invoke();
     }
 
@@ -396,6 +448,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
         set
         {
             _settings.TurnOffWhenMac = value; _settings.Save();
+            if (!value) ForgetDetachedIfSwapped();
             if (!value && _settings.DetachedDevice.Length > 0)
             {
                 var d = (_settings.DetachedDevice, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
@@ -453,10 +506,28 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     double IDashboardHost.MacMouseSpeed { get => _settings.MacMouseSpeed; set { _settings.MacMouseSpeed = value; _emu.Speed = value; _settings.Save(); } }
     double IDashboardHost.MacScrollSpeed { get => _settings.MacScrollSpeed; set { _settings.MacScrollSpeed = value; _emu.ScrollSpeed = value; _settings.Save(); } }
     bool IDashboardHost.StartWithWindows { get => StartsWithWindows(); set => SetStartWithWindows(value); }
-    string IDashboardHost.SharedMonitorSerial
+    IReadOnlyList<string> IDashboardHost.SharedMonitorKeys => _settings.SharedMonitorKeys;
+
+    void IDashboardHost.SetSharedMonitor(string key, bool shared)
     {
-        get => _settings.SharedMonitorSerial ?? "";
-        set { _settings.SharedMonitorSerial = value; Ddc.PreferredSerial = value; _settings.Save(); Log.Write("monitor connected to the Mac: serial " + value); }
+        var keys = _settings.SharedMonitorKeys;
+        if (shared)
+        {
+            if (!BHDisplay.Core.MonitorMarks.IsKey(key) || keys.Contains(key) || keys.Count >= BHDisplay.Core.MonitorMarks.Max) return;
+            keys.Add(key);
+        }
+        else if (!keys.Remove(key)) return;
+        // A turn-off already decided under the OLD marks must not land: its worker picked a monitor before this
+        // change and would otherwise detach one that is no longer marked. (_offGen, not _switchGen: a switch in
+        // progress must still finish.)
+        Interlocked.Increment(ref _offGen);
+        _offTimer?.Stop();
+        // Keep the old single setting pointing at one of them, so an older build still finds a monitor.
+        _settings.SharedMonitorSerial = keys.FirstOrDefault() ?? "";
+        Ddc.PreferredKeys = keys.ToArray();
+        Ddc.MarkedMissing = false;                  // decided again by the next lookup
+        _settings.Save();
+        Log.Write($"monitor {(shared ? "marked as" : "no longer")} connected to the Mac: {key} ({keys.Count} marked in total)");
     }
 
     private void Forget(string fp)
@@ -739,6 +810,7 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
     /// Our output to the shared monitor back on and the main display given back (no-op when it isn't off).
     private void RestoreOutput(string why)
     {
+        ForgetDetachedIfSwapped();
         if (_settings.DetachedDevice.Length == 0) return;
         Log.Write($"{why}: turning this PC's output to the monitor back on");
         var d = (_settings.DetachedDevice, _settings.DetachedX, _settings.DetachedY, _settings.DetachedW, _settings.DetachedH, _settings.DetachedHz);
@@ -793,6 +865,28 @@ internal sealed class TrayApp : ApplicationContext, IDashboardHost
                 break;
             case ShareMsg.SwitchRequest q when _peerSharesMonitor && q.Code == _settings.PcPort:
                 // Only switches to THIS PC's input come here (we may need to turn our output on first).
+                // Accepting tells the Mac NOT to switch by itself, so only accept when we can really act: with a
+                // marked monitor that is not here (swapped for another unit) we used to accept and then refuse
+                // silently, which left the monitor on the Mac for good.
+                // First settle whether the monitor we turned off is still ours: if another one now sits in that display
+                // slot, the record is dropped HERE — before deciding — so the fresh count below decides, rather than a
+                // stale "our output is off" making us accept a switch Switch() would then fail.
+                ForgetDetachedIfSwapped();
+                int markedHere = MarkedHere();
+                if (CannotReachSharedMonitor(markedHere))
+                {
+                    Log.Write($"not switching to {Ddc.NameOf(q.Code)}: " + (markedHere == 0
+                        ? "no monitor marked as connected to the Mac is here" : $"{markedHere} marked monitors are here")
+                        + " — letting the Mac do it");
+                    if (Num.NowMs - _lastMissingWarn > 30000)
+                    {
+                        _lastMissingWarn = Num.NowMs;
+                        _icon.ShowBalloonTip(8000, "BHDisplay — tick your monitor", markedHere == 0
+                            ? "The monitor marked as connected to the Mac isn't here. If you swapped it for another one, click the BHDisplay icon and tick this monitor as connected to the Mac."
+                            : "Several monitors are marked as connected to the Mac and more than one is plugged in. Click the BHDisplay icon and untick the one that is not on the Mac here.", ToolTipIcon.Warning);
+                    }
+                    break;
+                }
                 s.Send(new ShareMsg.SwitchAccepted(q.Code));          // "I'm doing it" — the Mac must not switch itself
                 if (_switching || Num.NowMs - _lastPeerRequest < 1000) break;   // already on it
                 _lastPeerRequest = Num.NowMs;

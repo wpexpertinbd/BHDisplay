@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Checks the rules that decide which monitor BHDisplay may act on, and how the user's marks are stored
+       (windows/BHDisplayWin/Core/MonitorMarks.cs). No Windows needed. Run: dotnet run -c Release -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>MonitorMarksTests</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../windows/BHDisplayWin/Core/MonitorMarks.cs" />
+  </ItemGroup>
+</Project>
